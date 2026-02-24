@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mortgage-calculator"
+version = "0.1.0"
+description = "Danish mortgage analysis tool with Italian cross-border tax view"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+]
+
+[project.scripts]
+mortgage = "mortgage_calculator.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mortgage_calculator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
