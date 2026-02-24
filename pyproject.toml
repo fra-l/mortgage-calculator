@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mortgage-calculator"
 version = "0.1.0"
-description = "Danish mortgage analysis tool with Italian cross-border tax view"
+description = "Danish mortgage analysis tool with cross-border foreign property analysis"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

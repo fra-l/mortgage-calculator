@@ -6,8 +6,8 @@ Interactive Rich CLI for the Danish Mortgage Analysis Tool.
   2. Loan input prompts
   3. Comparison table (all institutions)
   4. Tax breakdown panel
-  5. Italian property Y/N branch
-  6. Italian P&L + treaty disclaimer
+  5. Foreign property Y/N branch
+  6. Foreign property P&L + cross-border tax note
   7. One-time costs summary
   8. Optional plain-text export
 """
@@ -32,11 +32,10 @@ from mortgage_calculator.data.rates import (
     LOAN_TYPES,
     RATES_DATE,
 )
-from mortgage_calculator.models import ItalianPropertyParams, LoanParams
+from mortgage_calculator.models import ForeignPropertyParams, LoanParams
 from mortgage_calculator.tax import (
-    IT_DEDUCTIBILITY_DISCLAIMER,
-    TREATY_NOTE,
-    analyze_italian_property,
+    CROSS_BORDER_TAX_NOTE,
+    analyze_foreign_property,
     combined_monthly_picture,
     compute_rentefradrag,
 )
@@ -243,79 +242,110 @@ def show_tax_breakdown(loan_result) -> None:
     console.print()
 
 
-# ── Step 5-6: Italian property ────────────────────────────────────────────────
+# ── Step 5-6: Foreign property ────────────────────────────────────────────────
 
-def prompt_italian_property() -> ItalianPropertyParams | None:
-    console.print("[bold]Step 4: Italian Rental Property[/bold]\n")
-    has_it = Confirm.ask(
-        "  Do you own an Italian rental property you want to include?", default=False
+def prompt_foreign_property() -> ForeignPropertyParams | None:
+    console.print("[bold]Step 4: Foreign Rental Property[/bold]\n")
+    has_foreign = Confirm.ask(
+        "  Do you own a foreign rental property you want to include?", default=False
     )
-    if not has_it:
+    if not has_foreign:
         return None
 
     console.print()
-    prop_value = FloatPrompt.ask("  Property value (EUR)", default=250_000.0)
-    rent = FloatPrompt.ask("  Monthly gross rental income (EUR)", default=1_200.0)
+    prop_value = FloatPrompt.ask("  Property value (foreign currency)", default=250_000.0)
+    rent = FloatPrompt.ask("  Monthly gross rental income (foreign currency)", default=1_200.0)
     expenses = FloatPrompt.ask(
-        "  Monthly operating expenses — maintenance, insurance, etc. (EUR)", default=200.0
+        "  Monthly operating expenses — maintenance, insurance, etc. (foreign currency)",
+        default=200.0,
     )
-    it_mortgage = FloatPrompt.ask(
-        "  Italian mortgage outstanding balance (EUR, 0 if none)", default=0.0
+    foreign_mortgage = FloatPrompt.ask(
+        "  Foreign mortgage outstanding balance (0 if none)", default=0.0
     )
-    it_rate = 0.0
-    if it_mortgage > 0:
-        it_rate = FloatPrompt.ask("  Italian mortgage annual rate (%)", default=3.5) / 100
+    foreign_rate = 0.0
+    if foreign_mortgage > 0:
+        foreign_rate = (
+            FloatPrompt.ask("  Foreign mortgage annual rate (%)", default=3.5) / 100
+        )
 
-    it_tax = FloatPrompt.ask(
-        "  Italian effective tax rate on rental income (%)", default=21.0
-    ) / 100
+    foreign_tax = (
+        FloatPrompt.ask(
+            "  Foreign effective income tax rate on rental income (%)", default=21.0
+        )
+        / 100
+    )
+    dk_tax = (
+        FloatPrompt.ask("  Danish marginal tax rate (%)", default=42.0) / 100
+    )
+    currency_rate = FloatPrompt.ask(
+        "  Exchange rate: 1 foreign unit = X DKK", default=EUR_DKK
+    )
+    annual_income = FloatPrompt.ask(
+        "  Your annual gross income in Denmark (DKK, for debt ceiling; 0 to skip)",
+        default=0.0,
+    )
+    debt_multiplier = 3.5
+    if annual_income > 0:
+        debt_multiplier = FloatPrompt.ask(
+            "  Debt ceiling multiplier (× annual income)", default=3.5
+        )
 
-    return ItalianPropertyParams(
-        property_value_eur=prop_value,
-        monthly_rental_income_eur=rent,
-        monthly_expenses_eur=expenses,
-        italian_mortgage_balance_eur=it_mortgage,
-        italian_mortgage_rate=it_rate,
-        italian_tax_rate=it_tax,
+    return ForeignPropertyParams(
+        property_value_foreign=prop_value,
+        monthly_rental_income_foreign=rent,
+        monthly_expenses_foreign=expenses,
+        foreign_mortgage_balance=foreign_mortgage,
+        foreign_mortgage_rate=foreign_rate,
+        foreign_income_tax_rate=foreign_tax,
+        dk_marginal_tax_rate=dk_tax,
+        currency_to_dkk=currency_rate,
+        annual_gross_income_dkk=annual_income,
+        debt_ceiling_multiplier=debt_multiplier,
     )
 
 
-def show_italian_panel(it_result, loan_result, month: int = 1) -> None:
-    console.print("[bold]Italian Property P&L[/bold]\n")
+def show_foreign_property_panel(fp_result, loan_result, month: int = 1) -> None:
+    console.print("[bold]Foreign Property P&L[/bold]\n")
 
-    combined = combined_monthly_picture(loan_result, it_result, month=month)
+    combined = combined_monthly_picture(loan_result, fp_result, month=month)
 
-    it_text = (
-        f"  Gross rental income:     EUR {it_result.gross_monthly_eur:,.2f}\n"
-        f"  Operating expenses:      EUR {it_result.expenses_monthly_eur:,.2f}\n"
-        f"  IT mortgage interest:    EUR {it_result.italian_mortgage_interest_eur:,.2f}\n"
-        f"  Italian tax ({it_result.italian_tax_monthly_eur/max(it_result.gross_monthly_eur-it_result.expenses_monthly_eur-it_result.italian_mortgage_interest_eur, 1)*100:.0f}%):      "
-        f"[red]EUR {it_result.italian_tax_monthly_eur:,.2f}[/red]\n"
+    fp_text = (
+        f"  Gross rental income:            {fp_result.gross_monthly_foreign:,.2f}\n"
+        f"  − Operating expenses:           {fp_result.expenses_monthly_foreign:,.2f}\n"
+        f"  − Foreign mortgage interest:    {fp_result.foreign_mortgage_interest_foreign:,.2f}\n"
         f"  ─────────────────────────────────────\n"
-        f"  Net monthly (EUR):       [green]EUR {it_result.net_monthly_eur:,.2f}[/green]\n"
-        f"  Net monthly (DKK):       [green]{_fmt_dkk(it_result.net_monthly_dkk)}[/green]\n"
+        f"  Taxable base:                   {fp_result.taxable_base_foreign:,.2f}\n"
+        f"  − Foreign tax:                  [red]{fp_result.foreign_tax_monthly_foreign:,.2f}[/red]\n"
+        f"  ─────────────────────────────────────\n"
+        f"  Net after foreign tax:          [green]{fp_result.net_monthly_foreign:,.2f}[/green]  (foreign currency)\n"
+        f"  − DK top-up tax:                [red]{_fmt_dkk(fp_result.dk_topup_tax_monthly_dkk)}[/red]\n"
+        f"  ─────────────────────────────────────\n"
+        f"  Net monthly income (DKK):       [green]{_fmt_dkk(fp_result.net_monthly_dkk)}[/green]\n"
     )
-    console.print(Panel(it_text, title="Italian Rental P&L", border_style="yellow"))
+    console.print(Panel(fp_text, title="Foreign Rental P&L", border_style="yellow"))
+
+    if fp_result.max_total_debt_dkk > 0:
+        debt_text = (
+            f"  Max total debt:                 {_fmt_dkk(fp_result.max_total_debt_dkk)}\n"
+            f"  − Foreign mortgage (DKK):       {_fmt_dkk(fp_result.foreign_mortgage_dkk)}\n"
+            f"  ─────────────────────────────────────\n"
+            f"  Available DK debt headroom:     [bold]{_fmt_dkk(fp_result.available_dk_debt_dkk)}[/bold]\n"
+        )
+        console.print(Panel(debt_text, title="Debt Ceiling Analysis", border_style="blue"))
 
     combined_text = (
         f"  [bold]Combined Monthly Picture (Month {month})[/bold]\n\n"
-        f"  DK mortgage gross:       {_fmt_dkk(combined['dk_gross_cost_dkk'])}\n"
-        f"  Rentefradrag saving:     [green]-{_fmt_dkk(combined['rentefradrag_saving_dkk'])}[/green]\n"
-        f"  DK mortgage net:         {_fmt_dkk(combined['dk_net_cost_dkk'])}\n"
-        f"  Italian net income:      [green]-{_fmt_dkk(combined['it_income_dkk'])}[/green]\n"
+        f"  DK mortgage gross:          {_fmt_dkk(combined['dk_gross_cost_dkk'])}\n"
+        f"  Rentefradrag saving:        [green]-{_fmt_dkk(combined['rentefradrag_saving_dkk'])}[/green]\n"
+        f"  DK mortgage net:            {_fmt_dkk(combined['dk_net_cost_dkk'])}\n"
+        f"  Foreign property net income:[green]-{_fmt_dkk(combined['foreign_income_dkk'])}[/green]\n"
         f"  ─────────────────────────────────────\n"
-        f"  Net monthly outflow:     [bold]{_fmt_dkk(combined['combined_net_dkk'])}[/bold]\n"
+        f"  Net monthly outflow:        [bold]{_fmt_dkk(combined['combined_net_dkk'])}[/bold]\n"
     )
-    console.print(Panel(combined_text, title="Combined DK + Italy", border_style="magenta"))
+    console.print(Panel(combined_text, title="Combined DK + Foreign", border_style="magenta"))
 
-    # Treaty note
-    console.print(Panel(TREATY_NOTE, title="DK-IT Treaty (1999)", border_style="dim"))
     console.print(
-        Panel(
-            IT_DEDUCTIBILITY_DISCLAIMER,
-            title="[bold yellow]Italian Mortgage Interest Deductibility — DISCLAIMER[/bold yellow]",
-            border_style="yellow",
-        )
+        Panel(CROSS_BORDER_TAX_NOTE, title="Cross-Border Tax Note", border_style="dim")
     )
     console.print()
 
@@ -364,7 +394,7 @@ def export_report(
     params: LoanParams,
     ranked: list,
     loan_result,
-    it_result=None,
+    fp_result=None,
 ) -> None:
     path = Path(
         Prompt.ask(
@@ -407,18 +437,25 @@ def export_report(
         f"  ÅOP:                   {_fmt_pct(loan_result.aop)}",
     ]
 
-    if it_result:
+    if fp_result:
         lines += [
             "",
-            "ITALIAN PROPERTY",
-            f"  Net monthly (EUR):  EUR {it_result.net_monthly_eur:,.2f}",
-            f"  Net monthly (DKK):  {_fmt_dkk(it_result.net_monthly_dkk)}",
+            "FOREIGN PROPERTY",
+            f"  Net monthly (foreign): {fp_result.net_monthly_foreign:,.2f}",
+            f"  Net monthly (DKK):     {_fmt_dkk(fp_result.net_monthly_dkk)}",
+        ]
+        if fp_result.max_total_debt_dkk > 0:
+            lines += [
+                "",
+                "DEBT CEILING ANALYSIS",
+                f"  Max total debt:        {_fmt_dkk(fp_result.max_total_debt_dkk)}",
+                f"  Foreign mortgage (DKK):{_fmt_dkk(fp_result.foreign_mortgage_dkk)}",
+                f"  Available DK debt:     {_fmt_dkk(fp_result.available_dk_debt_dkk)}",
+            ]
+        lines += [
             "",
-            "DK-IT TREATY NOTE",
-            TREATY_NOTE,
-            "",
-            "DISCLAIMER",
-            IT_DEDUCTIBILITY_DISCLAIMER,
+            "CROSS-BORDER TAX NOTE",
+            CROSS_BORDER_TAX_NOTE,
         ]
 
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -453,20 +490,20 @@ def main() -> None:
         # Step 4: Tax breakdown
         show_tax_breakdown(loan_result)
 
-        # Step 7: One-time costs (shown before Italian branch)
+        # Step 7: One-time costs (shown before foreign property branch)
         show_one_time_costs(loan_result)
 
-        # Step 5-6: Italian property
-        it_params = prompt_italian_property()
-        it_result = None
-        if it_params:
-            it_result = analyze_italian_property(it_params)
-            show_italian_panel(it_result, loan_result, month=1)
+        # Step 5-6: Foreign property
+        fp_params = prompt_foreign_property()
+        fp_result = None
+        if fp_params:
+            fp_result = analyze_foreign_property(fp_params)
+            show_foreign_property_panel(fp_result, loan_result, month=1)
 
         # Step 8: Export
         console.print()
         if Confirm.ask("  Export plain-text report?", default=False):
-            export_report(params, ranked, loan_result, it_result)
+            export_report(params, ranked, loan_result, fp_result)
 
         console.print("\n[bold cyan]Done.[/bold cyan]")
 
