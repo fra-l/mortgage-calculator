@@ -11,6 +11,8 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2",
     "rich>=13",
+    "PyQt6>=6.6",
+    "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +23,7 @@ dev = [
 
 [project.scripts]
 mortgage = "mortgage_calculator.cli:main"
+mortgage-gui = "mortgage_calculator.gui:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mortgage_calculator"]
