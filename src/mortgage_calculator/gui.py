@@ -311,6 +311,82 @@ class PaymentBreakdownChartWidget(QWidget):
         self._canvas.draw()
 
 
+# ── Cost comparison charts (Tab 3) ────────────────────────────────────────────
+
+class CostComparisonWidget(QWidget):
+    """
+    Tab 3 — Institution comparison charts.
+
+    Left subplot : Cumulative cost over time — one line per institution,
+                   cheapest stays lowest.  Selected institution is dashed.
+    Right subplot: Lifetime cost pie for the selected institution —
+                   slices for bond interest, bidragssats, one-time costs,
+                   and principal.
+    """
+
+    _PIE_LABELS = ["Bond interest", "Bidragssats", "One-time costs", "Principal"]
+    _PIE_COLORS = ["#f4a460", "#fd8d3c", "#d9534f", "#6baed6"]
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fig = Figure(constrained_layout=True)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(self._canvas)
+
+    def refresh(self, ranked: list, loan_result: object) -> None:
+        """Redraw both subplots from fresh computation results."""
+        self._fig.clear()
+        ax_cum, ax_pie = self._fig.subplots(1, 2)
+
+        cheapest_inst = ranked[0].institution
+        selected_inst = loan_result.params.institution
+
+        # ── Cumulative cost lines ─────────────────────────────────────────────
+        for r in ranked:
+            sched = r.result.schedule
+            running = r.result.one_time_costs
+            cumulative: list[float] = []
+            for row in sched:
+                running += row.total_payment
+                cumulative.append(running)
+            months = [row.month for row in sched]
+
+            is_cheapest = r.institution == cheapest_inst
+            is_selected = r.institution == selected_inst
+            lw = 2.5 if (is_cheapest or is_selected) else 1.2
+            ls = "--" if (is_selected and not is_cheapest) else "-"
+            ax_cum.plot(months, cumulative, linewidth=lw, linestyle=ls, label=r.institution)
+
+        ax_cum.set_xlabel("Month")
+        ax_cum.set_ylabel("Cumulative cost (DKK)")
+        ax_cum.set_title("Cumulative Cost Over Time")
+        ax_cum.yaxis.set_major_formatter(FuncFormatter(_dkk_fmt))
+        ax_cum.legend(fontsize=8, loc="upper left")
+
+        # ── Lifetime cost pie ─────────────────────────────────────────────────
+        sizes = [
+            loan_result.total_bond_interest,
+            loan_result.total_bidragssats,
+            loan_result.one_time_costs,
+            loan_result.total_principal,
+        ]
+        ax_pie.pie(
+            sizes,
+            labels=self._PIE_LABELS,
+            colors=self._PIE_COLORS,
+            autopct="%1.1f%%",
+            startangle=140,
+        )
+        ax_pie.set_title(
+            f"Lifetime Cost Breakdown\n({loan_result.params.institution})",
+            fontsize=10,
+        )
+
+        self._canvas.draw()
+
+
 # ── Input panel ───────────────────────────────────────────────────────────────
 
 class InputPanel(QWidget):
@@ -589,10 +665,11 @@ class MortgageWindow(QMainWindow):
         self.comparison_table = ComparisonTableWidget()
         self.amortization_chart = AmortizationChartWidget()
         self.payment_breakdown_chart = PaymentBreakdownChartWidget()
+        self.cost_comparison_widget = CostComparisonWidget()
         self.tabs.addTab(self.comparison_table, "Comparison")
         self.tabs.addTab(self.amortization_chart, "Amortization")
         self.tabs.addTab(self.payment_breakdown_chart, "Payment Breakdown")
-        self.tabs.addTab(self._placeholder("Institution comparison lines & cost pie\n(Task 6)"), "Cost Comparison")
+        self.tabs.addTab(self.cost_comparison_widget, "Cost Comparison")
         self.tabs.addTab(self._placeholder("Rentefradrag & one-time costs panels\n(Task 7)"), "Tax & Costs")
         self.tabs.addTab(self._placeholder("Italian rental property P&L\n(Task 8)"), "Italian Property")
         splitter.addWidget(self.tabs)
@@ -649,6 +726,10 @@ class MortgageWindow(QMainWindow):
             io_months = self._loan_result.params.io_years * 12
             self.amortization_chart.refresh(schedule, io_months)
             self.payment_breakdown_chart.refresh(schedule)
+
+        # Issue 17 — institution comparison & cost breakdown charts
+        if self._ranked is not None and self._loan_result is not None:
+            self.cost_comparison_widget.refresh(self._ranked, self._loan_result)
 
     def _placeholder(self, text: str) -> QWidget:
         """Centred placeholder for tabs not yet implemented."""
