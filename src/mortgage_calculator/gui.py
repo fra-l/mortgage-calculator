@@ -27,13 +27,14 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHeaderView,
     QLabel,
     QMainWindow,
@@ -50,7 +51,19 @@ from PyQt6.QtWidgets import (
 
 from mortgage_calculator.calculator import analyze_loan
 from mortgage_calculator.comparison import rank_with_breakeven
-from mortgage_calculator.data.rates import BOND_KURS, INSTITUTIONS, LOAN_TYPES
+from mortgage_calculator.data.rates import (
+    BOND_KURS,
+    ESTABLISHMENT_FEE_DKK,
+    INSTITUTIONS,
+    KURSKAERING_RATE,
+    LOAN_TYPES,
+    RENTEFRADRAG_RATE_HIGH,
+    RENTEFRADRAG_RATE_LOW,
+    RENTEFRADRAG_THRESHOLD_DKK,
+    TINGLYSNING_FLAT_DKK,
+    TINGLYSNING_RATE,
+)
+from mortgage_calculator.tax import compute_rentefradrag
 from mortgage_calculator.models import LoanParams
 
 # ── Tab index constants ───────────────────────────────────────────────────────
@@ -387,6 +400,176 @@ class CostComparisonWidget(QWidget):
         self._canvas.draw()
 
 
+# ── Tax & costs panels (Tab 4) ────────────────────────────────────────────────
+
+def _bold(text: str) -> QLabel:
+    """Return a QLabel with bold font."""
+    lbl = QLabel(text)
+    f = QFont()
+    f.setBold(True)
+    lbl.setFont(f)
+    return lbl
+
+
+def _dkk(value: float) -> str:
+    """Format a DKK value as 'DKK X,XXX'."""
+    return f"DKK {value:,.0f}"
+
+
+class TaxCostsPanelWidget(QWidget):
+    """
+    Tab 4 — Tax & Costs.
+
+    Two QGroupBox panels inside a scroll area:
+      1. Rentefradrag: year 1, year 5, lifetime savings + rate explanation.
+      2. One-time costs: itemised breakdown with totals in bold.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self._container = QWidget()
+        self._vlayout = QVBoxLayout(self._container)
+        self._vlayout.setSpacing(16)
+        self._vlayout.setContentsMargins(12, 12, 12, 12)
+        self._vlayout.addStretch()
+
+        scroll.setWidget(self._container)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+    def refresh(self, loan_result: object) -> None:
+        """Rebuild both panels with fresh computation data."""
+        # Remove all existing widgets
+        while self._vlayout.count():
+            item = self._vlayout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self._vlayout.addWidget(self._build_rentefradrag_group(loan_result))
+        self._vlayout.addWidget(self._build_one_time_costs_group(loan_result))
+        self._vlayout.addStretch()
+
+    # ── Group builders ─────────────────────────────────────────────────────
+
+    def _build_rentefradrag_group(self, loan_result: object) -> QGroupBox:
+        schedule = loan_result.schedule
+        term_years = loan_result.params.term_years
+
+        box = QGroupBox("Rentefradrag (Interest Tax Deduction)")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+
+        def _annual_interest(year: int) -> float:
+            start = (year - 1) * 12
+            end = min(year * 12, len(schedule))
+            return sum(row.bond_interest for row in schedule[start:end])
+
+        def _row(label: str, value: float, bold: bool = False) -> None:
+            lbl = _bold(label) if bold else QLabel(label)
+            val = _bold(_dkk(value)) if bold else QLabel(_dkk(value))
+            form.addRow(lbl, val)
+
+        # Year 1
+        y1_interest = _annual_interest(1)
+        y1_saving = compute_rentefradrag(y1_interest)
+        _row("Year 1 — bond interest:", y1_interest)
+        _row("Year 1 — tax saving:", y1_saving)
+
+        form.addRow(self._separator())
+
+        # Year 5 (only if loan is at least 5 years)
+        if term_years >= 5:
+            y5_interest = _annual_interest(5)
+            y5_saving = compute_rentefradrag(y5_interest)
+            _row("Year 5 — bond interest:", y5_interest)
+            _row("Year 5 — tax saving:", y5_saving)
+            form.addRow(self._separator())
+
+        # Lifetime saving (accurate: computed year-by-year)
+        lifetime_saving = sum(
+            compute_rentefradrag(_annual_interest(y))
+            for y in range(1, term_years + 1)
+        )
+        _row("Lifetime saving (approx):", lifetime_saving, bold=True)
+
+        # Rate explanation
+        note = QLabel(
+            f"Rate: {RENTEFRADRAG_RATE_LOW:.0%} on first "
+            f"DKK {RENTEFRADRAG_THRESHOLD_DKK:,.0f} of annual bond interest; "
+            f"{RENTEFRADRAG_RATE_HIGH:.0%} on the amount above.\n"
+            "Applies to bond interest only — bidragssats is NOT deductible."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555; font-size: 11px;")
+        form.addRow(note)
+
+        return box
+
+    def _build_one_time_costs_group(self, loan_result: object) -> QGroupBox:
+        loan = loan_result.params.loan_amount_dkk
+        kurs = loan_result.params.bond_kurs
+
+        box = QGroupBox("One-Time Costs at Origination")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+
+        tinglysning_flat = float(TINGLYSNING_FLAT_DKK)
+        tinglysning_pct = TINGLYSNING_RATE * loan
+        establishment = float(ESTABLISHMENT_FEE_DKK)
+        kurskaering = KURSKAERING_RATE * loan
+        kurs_discount = max(0.0, (100.0 - kurs) / 100.0 * loan)
+        total = tinglysning_flat + tinglysning_pct + establishment + kurskaering + kurs_discount
+
+        form.addRow(
+            QLabel(f"Tinglysning (flat):"),
+            QLabel(_dkk(tinglysning_flat)),
+        )
+        form.addRow(
+            QLabel(f"Tinglysning ({TINGLYSNING_RATE:.2%} of loan):"),
+            QLabel(_dkk(tinglysning_pct)),
+        )
+        form.addRow(QLabel("Establishment fee:"), QLabel(_dkk(establishment)))
+        form.addRow(
+            QLabel(f"Kursskæring ({KURSKAERING_RATE:.2%} of loan):"),
+            QLabel(_dkk(kurskaering)),
+        )
+
+        if kurs_discount > 0:
+            form.addRow(
+                QLabel(f"Kurs discount ({100 - kurs:.1f}% of face value):"),
+                QLabel(_dkk(kurs_discount)),
+            )
+            note = QLabel(
+                f"Bond kurs {kurs:.1f}: you receive "
+                f"DKK {loan * kurs / 100:,.0f} cash "
+                f"but repay DKK {loan:,.0f} face value."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #555; font-size: 11px;")
+            form.addRow(note)
+        else:
+            form.addRow(
+                QLabel("Kurs discount:"),
+                QLabel("— (kurs ≥ 100, no discount)"),
+            )
+
+        form.addRow(self._separator())
+        form.addRow(_bold("Total one-time costs:"), _bold(_dkk(total)))
+
+        return box
+
+    def _separator(self) -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        return line
+
+
 # ── Input panel ───────────────────────────────────────────────────────────────
 
 class InputPanel(QWidget):
@@ -666,11 +849,12 @@ class MortgageWindow(QMainWindow):
         self.amortization_chart = AmortizationChartWidget()
         self.payment_breakdown_chart = PaymentBreakdownChartWidget()
         self.cost_comparison_widget = CostComparisonWidget()
+        self.tax_costs_panel = TaxCostsPanelWidget()
         self.tabs.addTab(self.comparison_table, "Comparison")
         self.tabs.addTab(self.amortization_chart, "Amortization")
         self.tabs.addTab(self.payment_breakdown_chart, "Payment Breakdown")
         self.tabs.addTab(self.cost_comparison_widget, "Cost Comparison")
-        self.tabs.addTab(self._placeholder("Rentefradrag & one-time costs panels\n(Task 7)"), "Tax & Costs")
+        self.tabs.addTab(self.tax_costs_panel, "Tax & Costs")
         self.tabs.addTab(self._placeholder("Italian rental property P&L\n(Task 8)"), "Italian Property")
         splitter.addWidget(self.tabs)
 
@@ -730,6 +914,10 @@ class MortgageWindow(QMainWindow):
         # Issue 17 — institution comparison & cost breakdown charts
         if self._ranked is not None and self._loan_result is not None:
             self.cost_comparison_widget.refresh(self._ranked, self._loan_result)
+
+        # Issue 18 — tax & one-time costs panels
+        if self._loan_result is not None:
+            self.tax_costs_panel.refresh(self._loan_result)
 
     def _placeholder(self, text: str) -> QWidget:
         """Centred placeholder for tabs not yet implemented."""
