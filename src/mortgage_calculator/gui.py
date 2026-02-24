@@ -23,6 +23,9 @@ Signal flow:
 
 import sys
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
@@ -175,6 +178,137 @@ class ComparisonTableWidget(QTableWidget):
         self.resizeColumnsToContents()
         # Re-apply stretch after manual resize
         self.horizontalHeader().setStretchLastSection(True)
+
+
+# ── Chart helpers ─────────────────────────────────────────────────────────────
+
+def _dkk_fmt(x: float, _: object) -> str:
+    """Compact DKK axis label: 1,500,000 → '1.5M', 50,000 → '50k'."""
+    if abs(x) >= 1_000_000:
+        return f"{x / 1_000_000:.1f}M"
+    return f"{x / 1_000:.0f}k"
+
+
+# ── Amortization chart (Tab 1) ────────────────────────────────────────────────
+
+class AmortizationChartWidget(QWidget):
+    """
+    Tab 1 — Amortization waterfall.
+
+    Left y-axis : stacked area — bond interest (bottom) + principal (top).
+    Right y-axis: declining outstanding balance (line).
+    IO period   : shaded orange band.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fig = Figure(constrained_layout=True)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(self._canvas)
+
+    def refresh(self, schedule: list, io_months: int) -> None:
+        """Redraw with a fresh schedule."""
+        self._fig.clear()
+        ax = self._fig.add_subplot(111)
+
+        months = [row.month for row in schedule]
+        bond_interest = [row.bond_interest for row in schedule]
+        principal = [row.principal for row in schedule]
+        balance = [row.balance for row in schedule]
+
+        # IO shading
+        if io_months > 0:
+            ax.axvspan(
+                0.5, io_months + 0.5,
+                alpha=0.15, color="orange", label="IO period",
+            )
+
+        # Stacked area: bond interest (bottom) + principal (top)
+        ax.stackplot(
+            months,
+            bond_interest,
+            principal,
+            labels=["Bond interest", "Principal"],
+            colors=["#f4a460", "#6baed6"],
+            alpha=0.75,
+        )
+
+        # Balance on secondary y-axis
+        ax2 = ax.twinx()
+        ax2.plot(months, balance, color="#2ca02c", linewidth=2, label="Balance")
+        ax2.set_ylabel("Outstanding balance (DKK)", color="#2ca02c")
+        ax2.tick_params(axis="y", labelcolor="#2ca02c")
+        ax2.yaxis.set_major_formatter(FuncFormatter(_dkk_fmt))
+
+        ax.set_xlabel("Month")
+        ax.set_ylabel("Monthly amount (DKK)")
+        ax.set_title("Amortization Waterfall")
+        ax.yaxis.set_major_formatter(FuncFormatter(_dkk_fmt))
+
+        # Combined legend
+        handles1, labels1 = ax.get_legend_handles_labels()
+        handles2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(handles1 + handles2, labels1 + labels2, loc="upper right", fontsize=9)
+
+        self._canvas.draw()
+
+
+# ── Payment breakdown chart (Tab 2) ───────────────────────────────────────────
+
+class PaymentBreakdownChartWidget(QWidget):
+    """
+    Tab 2 — Monthly payment anatomy (stacked bar, sampled annually).
+
+    One bar per year, with three stacked segments:
+      - Bond interest (bottom)
+      - Bidragssats  (middle)
+      - Principal    (top)
+    Makes the shift from interest-heavy to principal-heavy visible over time.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fig = Figure(constrained_layout=True)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(self._canvas)
+
+    def refresh(self, schedule: list) -> None:
+        """Redraw with a fresh schedule, sampling one month per year."""
+        self._fig.clear()
+        ax = self._fig.add_subplot(111)
+
+        # Sample: take the last month of each year (month 12, 24, 36 …)
+        total_months = len(schedule)
+        term_years = total_months // 12
+        sampled = [schedule[min(y * 12 - 1, total_months - 1)] for y in range(1, term_years + 1)]
+
+        years = [f"Y{y}" for y in range(1, term_years + 1)]
+        bi = [row.bond_interest for row in sampled]
+        bids = [row.bidragssats for row in sampled]
+        princ = [row.principal for row in sampled]
+
+        x = range(len(years))
+        ax.bar(x, bi, label="Bond interest", color="#f4a460")
+        ax.bar(x, bids, bottom=bi, label="Bidragssats", color="#fd8d3c")
+        ax.bar(
+            x, princ,
+            bottom=[b + d for b, d in zip(bi, bids)],
+            label="Principal", color="#6baed6",
+        )
+
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(years, fontsize=8)
+        ax.set_xlabel("Year")
+        ax.set_ylabel("Monthly payment (DKK)")
+        ax.set_title("Monthly Payment Anatomy (sampled annually)")
+        ax.yaxis.set_major_formatter(FuncFormatter(_dkk_fmt))
+        ax.legend(loc="upper right", fontsize=9)
+
+        self._canvas.draw()
 
 
 # ── Input panel ───────────────────────────────────────────────────────────────
@@ -453,9 +587,11 @@ class MortgageWindow(QMainWindow):
         # Right: tabbed results
         self.tabs = QTabWidget()
         self.comparison_table = ComparisonTableWidget()
+        self.amortization_chart = AmortizationChartWidget()
+        self.payment_breakdown_chart = PaymentBreakdownChartWidget()
         self.tabs.addTab(self.comparison_table, "Comparison")
-        self.tabs.addTab(self._placeholder("Amortization & balance chart\n(Task 5)"), "Amortization")
-        self.tabs.addTab(self._placeholder("Monthly payment breakdown chart\n(Task 5)"), "Payment Breakdown")
+        self.tabs.addTab(self.amortization_chart, "Amortization")
+        self.tabs.addTab(self.payment_breakdown_chart, "Payment Breakdown")
         self.tabs.addTab(self._placeholder("Institution comparison lines & cost pie\n(Task 6)"), "Cost Comparison")
         self.tabs.addTab(self._placeholder("Rentefradrag & one-time costs panels\n(Task 7)"), "Tax & Costs")
         self.tabs.addTab(self._placeholder("Italian rental property P&L\n(Task 8)"), "Italian Property")
@@ -506,6 +642,13 @@ class MortgageWindow(QMainWindow):
                 breakeven=self._breakeven,
                 selected_institution=self._loan_result.params.institution,
             )
+
+        # Issue 16 — amortization & payment breakdown charts
+        if self._loan_result is not None:
+            schedule = self._loan_result.schedule
+            io_months = self._loan_result.params.io_years * 12
+            self.amortization_chart.refresh(schedule, io_months)
+            self.payment_breakdown_chart.refresh(schedule)
 
     def _placeholder(self, text: str) -> QWidget:
         """Centred placeholder for tabs not yet implemented."""
