@@ -24,12 +24,14 @@ Signal flow:
 import sys
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QPushButton,
@@ -37,6 +39,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -53,6 +57,124 @@ TAB_PAYMENT_BREAKDOWN = 2
 TAB_COST_COMPARISON = 3
 TAB_TAX_COSTS = 4
 TAB_ITALIAN = 5
+
+# ── Comparison table helpers ──────────────────────────────────────────────────
+
+_GREEN = QColor("#b7e4a7")  # cheapest row
+_CYAN = QColor("#aee8e8")   # user-selected row
+_INF_SORT = 1e15            # sentinel sort value for ∞ breakeven
+
+
+class _NumericItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts numerically via UserRole data."""
+
+    def __lt__(self, other: "QTableWidgetItem") -> bool:  # type: ignore[override]
+        my_val = self.data(Qt.ItemDataRole.UserRole)
+        other_val = other.data(Qt.ItemDataRole.UserRole)
+        if isinstance(my_val, (int, float)) and isinstance(other_val, (int, float)):
+            return my_val < other_val  # type: ignore[operator]
+        return super().__lt__(other)
+
+
+class ComparisonTableWidget(QTableWidget):
+    """
+    Sortable institution-comparison table (Tab 0).
+
+    Call refresh() after each computation to repopulate.  The cheapest
+    institution row is highlighted green; the user-selected institution
+    is highlighted cyan (cyan takes priority if both apply).
+    """
+
+    _HEADERS = [
+        "Rank",
+        "Institution",
+        "Total Cost (DKK)",
+        "Bidragssats Total",
+        "Bond Interest Total",
+        "ÅOP",
+        "Breakeven (months)",
+    ]
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(0, len(self._HEADERS), parent)
+        self.setHorizontalHeaderLabels(self._HEADERS)
+        self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.verticalHeader().setVisible(False)
+        hdr = self.horizontalHeader()
+        hdr.setSortIndicatorShown(True)
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setStretchLastSection(True)
+        self.setSortingEnabled(True)
+
+    def refresh(
+        self,
+        ranked: list,       # list[RankedResult]
+        breakeven: dict,    # dict[str, float]
+        selected_institution: str,
+    ) -> None:
+        """Populate / repaint from fresh computation results."""
+        self.setSortingEnabled(False)
+        self.clearContents()
+        self.setRowCount(len(ranked))
+
+        cheapest_inst = ranked[0].institution  # rank 1 is cheapest
+
+        RIGHT = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        CENTER = Qt.AlignmentFlag.AlignCenter
+
+        for row, r in enumerate(ranked):
+            bev_raw = breakeven.get(r.institution, 0.0)
+            if bev_raw == 0.0:
+                bev_text: str = "—"
+                bev_sort: float = 0.0
+            elif bev_raw == float("inf"):
+                bev_text = "∞"
+                bev_sort = _INF_SORT
+            else:
+                bev_text = f"{bev_raw:.1f}"
+                bev_sort = bev_raw
+
+            # (display_text, sort_key | None, alignment)
+            col_specs: list[tuple[str, float | None, Qt.AlignmentFlag]] = [
+                (str(r.rank),                       float(r.rank),          CENTER),
+                (r.institution,                     None,                   Qt.AlignmentFlag.AlignVCenter),
+                (f"{r.total_lifetime_cost:,.0f}",   r.total_lifetime_cost,  RIGHT),
+                (f"{r.total_bidragssats:,.0f}",     r.total_bidragssats,    RIGHT),
+                (f"{r.total_bond_interest:,.0f}",   r.total_bond_interest,  RIGHT),
+                (f"{r.aop * 100:.3f}%",             r.aop * 100,            RIGHT),
+                (bev_text,                          bev_sort,               RIGHT),
+            ]
+
+            for col, (text, sort_val, align) in enumerate(col_specs):
+                if sort_val is not None:
+                    item: QTableWidgetItem = _NumericItem(text)
+                    item.setData(Qt.ItemDataRole.UserRole, sort_val)
+                else:
+                    item = QTableWidgetItem(text)
+                item.setTextAlignment(align)
+                self.setItem(row, col, item)
+
+            # Row background — cyan for selected (highest priority), else green
+            # for cheapest; non-highlighted rows get no explicit colour.
+            if r.institution == selected_institution:
+                bg: QColor | None = _CYAN
+            elif r.institution == cheapest_inst:
+                bg = _GREEN
+            else:
+                bg = None
+
+            if bg is not None:
+                for col in range(len(self._HEADERS)):
+                    itm = self.item(row, col)
+                    if itm:
+                        itm.setBackground(bg)
+
+        self.setSortingEnabled(True)
+        self.resizeColumnsToContents()
+        # Re-apply stretch after manual resize
+        self.horizontalHeader().setStretchLastSection(True)
 
 
 # ── Input panel ───────────────────────────────────────────────────────────────
@@ -330,7 +452,8 @@ class MortgageWindow(QMainWindow):
 
         # Right: tabbed results
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._placeholder("Institution comparison table\n(Task 4)"), "Comparison")
+        self.comparison_table = ComparisonTableWidget()
+        self.tabs.addTab(self.comparison_table, "Comparison")
         self.tabs.addTab(self._placeholder("Amortization & balance chart\n(Task 5)"), "Amortization")
         self.tabs.addTab(self._placeholder("Monthly payment breakdown chart\n(Task 5)"), "Payment Breakdown")
         self.tabs.addTab(self._placeholder("Institution comparison lines & cost pie\n(Task 6)"), "Cost Comparison")
@@ -376,7 +499,13 @@ class MortgageWindow(QMainWindow):
 
     def _update_tabs(self) -> None:
         """Called after every computation. Each task adds its update call here."""
-        pass  # tasks 4-8 will extend this
+        # Task 4 — institution comparison table
+        if self._ranked is not None and self._breakeven is not None:
+            self.comparison_table.refresh(
+                ranked=self._ranked,
+                breakeven=self._breakeven,
+                selected_institution=self._loan_result.params.institution,
+            )
 
     def _placeholder(self, text: str) -> QWidget:
         """Centred placeholder for tabs not yet implemented."""
