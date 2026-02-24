@@ -125,14 +125,14 @@ class TestMortgageWindowPolish:
         assert window._export_action.isEnabled()
 
     def test_params_invalid_signal_emitted(self, qt_app):
-        """params_invalid is emitted when validation fails."""
+        """params_invalid is emitted when validation fails (LTV > 80%)."""
         from mortgage_calculator.gui import InputPanel
         panel = InputPanel()
         received = []
         panel.params_invalid.connect(received.append)
-        # Force a validation error: set io_years >= term_years
-        panel.io_years.setValue(panel.term_years.value())
-        # _calculate is triggered by io_years change
+        # Drive property value below loan_amount * 1.25 → LTV exceeds 80%
+        # Default loan_amount = 3_000_000; set property_value = 100_000 → LTV = 3000%
+        panel.prop_value.setValue(100_000)
         assert len(received) > 0
 
     def test_minimum_window_size(self, qt_app):
