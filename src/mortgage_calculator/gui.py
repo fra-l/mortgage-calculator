@@ -11,7 +11,8 @@ Layout:
             ├── Tab 2: Payment Breakdown
             ├── Tab 3: Cost Comparison
             ├── Tab 4: Tax & Costs
-            └── Tab 5: Foreign Property
+            ├── Tab 5: Foreign Property
+            └── Tab 6: Italian Property (hidden until checkbox enabled)
 
 Signal flow:
   InputPanel.params_ready(LoanParams)
@@ -32,6 +33,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -48,6 +50,7 @@ from PyQt6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -888,6 +891,323 @@ class ForeignPropertyPanelWidget(QWidget):
         return line
 
 
+# ── Italian property panel (Tab 6) ────────────────────────────────────────────
+
+_IT_EUR_TO_DKK = 7.46         # EUR/DKK near-fixed peg
+_IT_DEFAULT_TAX_RATE = 21.0   # cedolare secca standard (%)
+_IT_DEFAULT_MORTGAGE_RATE = 3.5  # common Italian mortgage rate (%)
+
+_DK_IT_TREATY_NOTE = (
+    "Denmark–Italy double taxation treaty (1999 Convention, in force 2002): "
+    "Under Article 6, rental income from Italian real property is taxed in Italy "
+    "as the source country. Denmark, as your country of tax residence, applies the "
+    "credit method (Article 23A): you pay Italian income tax locally and Denmark "
+    "taxes only the difference up to the Danish marginal rate (top-up tax). You "
+    "effectively pay the higher of the two rates — split between countries with no "
+    "double taxation. Consult a Danish tax adviser (Skatteforvaltningen) and an "
+    "Italian commercialista to confirm the treatment for your specific situation."
+)
+
+_IT_DEDUCTIBILITY_DISCLAIMER = (
+    "Italian rental tax regimes:\n\n"
+    "Cedolare secca (flat tax): 21 % standard rate (10 % for affordable-market "
+    "contracts under Art. 2-bis). No deductions are allowed — the flat rate applies "
+    "to gross rental income. Italian mortgage interest is NOT deductible under this "
+    "regime.\n\n"
+    "Ordinary IRPEF regime: Only 95 % of gross rent is taxable (5 % statutory "
+    "deduction). Other operating expenses are generally NOT deductible. Italian "
+    "mortgage interest on rental property is NOT deductible under IRPEF for private "
+    "individuals.\n\n"
+    "This tool applies your chosen effective tax rate to the taxable base you enter. "
+    "Adjust monthly expenses and mortgage details to reflect your actual regime and "
+    "situation."
+)
+
+
+class ItalianPropertyPanelWidget(QWidget):
+    """
+    Tab 6 — Italian Rental Property Analysis.
+
+    Self-contained panel: enter Italian property parameters with EUR currency
+    and Italian-specific tax defaults, click Compute, and see:
+      • Monthly P&L in EUR and DKK with cross-border tax breakdown.
+      • Danish debt ceiling analysis (foreign mortgage in DKK reduces headroom).
+      • Combined monthly picture (DK net cost minus Italian net income) when a
+        Danish loan result is available.
+      • Read-only informational boxes: DK–IT treaty note and Italian deductibility
+        disclaimer (cedolare secca vs IRPEF).
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._loan_result = None
+        self._setup_ui()
+
+    def set_loan_result(self, loan_result: object) -> None:
+        """Called by MortgageWindow after each Danish loan computation."""
+        self._loan_result = loan_result
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _setup_ui(self) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self._container = QWidget()
+        self._vlayout = QVBoxLayout(self._container)
+        self._vlayout.setSpacing(16)
+        self._vlayout.setContentsMargins(12, 12, 12, 12)
+
+        self._vlayout.addWidget(self._build_input_group())
+        self._vlayout.addWidget(self._build_info_group())
+        self._vlayout.addStretch()
+
+        scroll.setWidget(self._container)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+    def _build_input_group(self) -> QGroupBox:
+        box = QGroupBox("Italian Property Parameters (EUR)")
+        form = QFormLayout(box)
+        form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+        def _spinbox(
+            lo: float, hi: float, step: float, val: float,
+            decimals: int = 0, suffix: str = "",
+        ) -> QDoubleSpinBox:
+            sb = QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setSingleStep(step)
+            sb.setValue(val)
+            sb.setDecimals(decimals)
+            if decimals == 0:
+                sb.setGroupSeparatorShown(True)
+            if suffix:
+                sb.setSuffix(suffix)
+            return sb
+
+        self._prop_value = _spinbox(0, 100_000_000, 10_000, 250_000, suffix=" EUR")
+        form.addRow("Property value (EUR):", self._prop_value)
+
+        self._monthly_rent = _spinbox(0, 1_000_000, 100, 1_200, decimals=2, suffix=" EUR")
+        form.addRow("Monthly gross rental income (EUR):", self._monthly_rent)
+
+        self._monthly_expenses = _spinbox(0, 100_000, 50, 200, decimals=2, suffix=" EUR")
+        form.addRow("Monthly operating expenses (EUR):", self._monthly_expenses)
+
+        self._mortgage_balance = _spinbox(0, 10_000_000, 10_000, 0, suffix=" EUR")
+        form.addRow("Italian mortgage balance (EUR):", self._mortgage_balance)
+
+        self._mortgage_rate = _spinbox(
+            0, 20, 0.1, _IT_DEFAULT_MORTGAGE_RATE, decimals=2, suffix=" %"
+        )
+        form.addRow("Italian mortgage annual rate:", self._mortgage_rate)
+
+        self._foreign_tax_rate = _spinbox(
+            0, 60, 0.5, _IT_DEFAULT_TAX_RATE, decimals=1, suffix=" %"
+        )
+        self._foreign_tax_rate.setToolTip(
+            "Cedolare secca standard: 21 %\n"
+            "Cedolare secca affordable-market: 10 %\n"
+            "IRPEF: enter your effective marginal rate"
+        )
+        form.addRow("Italian effective tax rate:", self._foreign_tax_rate)
+
+        self._dk_tax_rate = _spinbox(0, 60, 0.5, 42.0, decimals=1, suffix=" %")
+        form.addRow("DK marginal tax rate:", self._dk_tax_rate)
+
+        self._eur_to_dkk = _spinbox(
+            0.01, 10_000, 0.01, _IT_EUR_TO_DKK, decimals=4, suffix=" DKK/EUR"
+        )
+        self._eur_to_dkk.setToolTip(
+            "EUR/DKK is near-fixed (~7.46). Update with current interbank rate."
+        )
+        form.addRow("EUR → DKK rate:", self._eur_to_dkk)
+
+        self._annual_income = _spinbox(
+            0, 100_000_000, 50_000, 600_000, suffix=" DKK"
+        )
+        form.addRow("Annual gross income (DKK, for debt ceiling):", self._annual_income)
+
+        self._debt_multiplier = _spinbox(1, 10, 0.5, 3.5, decimals=1)
+        form.addRow("Debt ceiling multiplier (× income):", self._debt_multiplier)
+
+        compute_btn = QPushButton("Compute")
+        compute_btn.setStyleSheet(
+            "QPushButton { font-weight: bold; padding: 6px; }"
+            "QPushButton:hover { background: #0078d7; color: white; }"
+        )
+        compute_btn.clicked.connect(self._compute)
+        form.addRow(compute_btn)
+
+        return box
+
+    def _build_info_group(self) -> QGroupBox:
+        """Read-only informational boxes: DK–IT treaty note + disclaimer."""
+        box = QGroupBox("Tax Notes & Disclaimer")
+        layout = QVBoxLayout(box)
+        layout.setSpacing(10)
+
+        lbl_treaty = QLabel("Denmark–Italy Tax Treaty (credit method):")
+        lbl_treaty.setStyleSheet("font-weight: bold;")
+        layout.addWidget(lbl_treaty)
+
+        treaty_box = QTextEdit()
+        treaty_box.setReadOnly(True)
+        treaty_box.setPlainText(_DK_IT_TREATY_NOTE)
+        treaty_box.setFixedHeight(100)
+        treaty_box.setStyleSheet("color: #444; font-size: 11px; background: #f7f7f7;")
+        layout.addWidget(treaty_box)
+
+        lbl_deduct = QLabel("Italian rental tax regimes (deductibility):")
+        lbl_deduct.setStyleSheet("font-weight: bold;")
+        layout.addWidget(lbl_deduct)
+
+        deduct_box = QTextEdit()
+        deduct_box.setReadOnly(True)
+        deduct_box.setPlainText(_IT_DEDUCTIBILITY_DISCLAIMER)
+        deduct_box.setFixedHeight(130)
+        deduct_box.setStyleSheet("color: #444; font-size: 11px; background: #f7f7f7;")
+        layout.addWidget(deduct_box)
+
+        return box
+
+    # ── Compute & results ─────────────────────────────────────────────────────
+
+    def _compute(self) -> None:
+        params = ForeignPropertyParams(
+            property_value_foreign=self._prop_value.value(),
+            monthly_rental_income_foreign=self._monthly_rent.value(),
+            monthly_expenses_foreign=self._monthly_expenses.value(),
+            foreign_mortgage_balance=self._mortgage_balance.value(),
+            foreign_mortgage_rate=self._mortgage_rate.value() / 100,
+            foreign_income_tax_rate=self._foreign_tax_rate.value() / 100,
+            dk_marginal_tax_rate=self._dk_tax_rate.value() / 100,
+            currency_to_dkk=self._eur_to_dkk.value(),
+            annual_gross_income_dkk=self._annual_income.value(),
+            debt_ceiling_multiplier=self._debt_multiplier.value(),
+        )
+        result = analyze_foreign_property(params)
+        self._show_results(result)
+
+    def _show_results(self, result: object) -> None:
+        # Remove all widgets after the input group (index 0) and info group (index 1)
+        while self._vlayout.count() > 2:
+            item = self._vlayout.takeAt(2)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self._vlayout.addWidget(self._build_pl_group(result))
+        self._vlayout.addWidget(self._build_debt_ceiling_group(result))
+
+        if self._loan_result is not None:
+            self._vlayout.addWidget(self._build_combined_group(result))
+
+        self._vlayout.addStretch()
+
+    def _build_pl_group(self, result: object) -> QGroupBox:
+        box = QGroupBox("Italian Rental P&L (Monthly)")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+
+        def _erow(label: str, value: float, bold: bool = False) -> None:
+            """Row with EUR value."""
+            lbl = _bold(label) if bold else QLabel(label)
+            val = _bold(f"EUR {value:,.2f}") if bold else QLabel(f"EUR {value:,.2f}")
+            form.addRow(lbl, val)
+
+        def _drow(label: str, value: float, bold: bool = False) -> None:
+            """Row with DKK value."""
+            lbl = _bold(label) if bold else QLabel(label)
+            val = _bold(_dkk(value)) if bold else QLabel(_dkk(value))
+            form.addRow(lbl, val)
+
+        _erow("Gross rental income:", result.gross_monthly_foreign)
+        _erow("− Operating expenses:", result.expenses_monthly_foreign)
+        _erow("− Italian mortgage interest:", result.foreign_mortgage_interest_foreign)
+        form.addRow(self._sep())
+        _erow("Taxable base:", result.taxable_base_foreign)
+        _erow("− Italian income tax:", result.foreign_tax_monthly_foreign)
+        form.addRow(self._sep())
+        _erow("Net after Italian tax (EUR):", result.net_monthly_foreign, bold=True)
+        form.addRow(self._sep())
+        _drow("− DK top-up tax:", result.dk_topup_tax_monthly_dkk)
+        form.addRow(self._sep())
+        _drow("Net monthly income (DKK):", result.net_monthly_dkk, bold=True)
+
+        return box
+
+    def _build_debt_ceiling_group(self, result: object) -> QGroupBox:
+        box = QGroupBox("Danish Debt Ceiling Analysis")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+
+        if result.max_total_debt_dkk > 0:
+            form.addRow(
+                QLabel("Max total debt:"), QLabel(_dkk(result.max_total_debt_dkk))
+            )
+            form.addRow(
+                QLabel("− Italian mortgage (DKK):"),
+                QLabel(_dkk(result.foreign_mortgage_dkk)),
+            )
+            form.addRow(self._sep())
+            form.addRow(
+                _bold("Available DK debt headroom:"),
+                _bold(_dkk(result.available_dk_debt_dkk)),
+            )
+        else:
+            note = QLabel(
+                "Annual gross income not entered — debt ceiling not computed.\n"
+                "Enter your Danish annual gross income above and re-compute."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #888; font-size: 11px;")
+            form.addRow(note)
+
+        return box
+
+    def _build_combined_group(self, result: object) -> QGroupBox:
+        box = QGroupBox("Combined Monthly Picture (Month 1)")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+
+        combined = combined_monthly_picture(self._loan_result, result, month=1)
+
+        form.addRow(
+            QLabel("DK mortgage gross cost:"),
+            QLabel(_dkk(combined["dk_gross_cost_dkk"])),
+        )
+        form.addRow(
+            QLabel("− Rentefradrag saving:"),
+            QLabel(_dkk(combined["rentefradrag_saving_dkk"])),
+        )
+        form.addRow(self._sep())
+        form.addRow(
+            QLabel("DK mortgage net cost:"),
+            QLabel(_dkk(combined["dk_net_cost_dkk"])),
+        )
+        form.addRow(
+            QLabel("− Italian property net income:"),
+            QLabel(_dkk(combined["foreign_income_dkk"])),
+        )
+        form.addRow(self._sep())
+        form.addRow(
+            _bold("Net monthly outflow (DKK):"),
+            _bold(_dkk(combined["combined_net_dkk"])),
+        )
+
+        return box
+
+    def _sep(self) -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        return line
+
+
 # ── Input panel ───────────────────────────────────────────────────────────────
 
 class InputPanel(QWidget):
@@ -900,8 +1220,9 @@ class InputPanel(QWidget):
     MortgageWindow listens to both signals.
     """
 
-    params_ready = pyqtSignal(object)   # LoanParams
-    params_invalid = pyqtSignal(str)    # validation error message
+    params_ready = pyqtSignal(object)          # LoanParams
+    params_invalid = pyqtSignal(str)           # validation error message
+    italian_property_toggled = pyqtSignal(bool)  # Italian property tab toggle
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1008,6 +1329,16 @@ class InputPanel(QWidget):
         outer.addLayout(form)
         outer.addSpacing(6)
 
+        # Italian property tab toggle
+        self.italian_checkbox = QCheckBox("Include Italian rental property")
+        self.italian_checkbox.setToolTip(
+            "Show / hide the Italian Property tab (Tab 6).\n"
+            "When enabled, use the Italian Property tab to enter rental details."
+        )
+        outer.addWidget(self.italian_checkbox)
+
+        outer.addSpacing(4)
+
         # Calculate button
         self.calc_btn = QPushButton("Calculate")
         self.calc_btn.setStyleSheet(
@@ -1048,6 +1379,9 @@ class InputPanel(QWidget):
         self.io_years.valueChanged.connect(self._calculate)
         self.institution.currentTextChanged.connect(self._calculate)
         self.calc_btn.clicked.connect(self._calculate)
+
+        # Italian property tab toggle
+        self.italian_checkbox.toggled.connect(self.italian_property_toggled)
 
     # ── Slot handlers ─────────────────────────────────────────────────────────
 
@@ -1180,12 +1514,16 @@ class MortgageWindow(QMainWindow):
         self.cost_comparison_widget = CostComparisonWidget()
         self.tax_costs_panel = TaxCostsPanelWidget()
         self.foreign_property_panel = ForeignPropertyPanelWidget()
+        self.italian_property_panel = ItalianPropertyPanelWidget()
         self.tabs.addTab(self.comparison_table, "Comparison")
         self.tabs.addTab(self.amortization_chart, "Amortization")
         self.tabs.addTab(self.payment_breakdown_chart, "Payment Breakdown")
         self.tabs.addTab(self.cost_comparison_widget, "Cost Comparison")
         self.tabs.addTab(self.tax_costs_panel, "Tax & Costs")
         self.tabs.addTab(self.foreign_property_panel, "Foreign Property")
+        self.tabs.addTab(self.italian_property_panel, "Italian Property")
+        self._italian_tab_index = self.tabs.count() - 1
+        self.tabs.setTabVisible(self._italian_tab_index, False)
         splitter.addWidget(self.tabs)
 
         splitter.setSizes([360, 840])
@@ -1199,6 +1537,9 @@ class MortgageWindow(QMainWindow):
         self.input_panel.params_ready.connect(self._on_params_ready)
         self.input_panel.params_invalid.connect(
             lambda msg: self.statusBar().showMessage(f"Invalid input: {msg}")
+        )
+        self.input_panel.italian_property_toggled.connect(
+            self._on_italian_property_toggled
         )
 
     def _on_params_ready(self, params: LoanParams) -> None:
@@ -1279,6 +1620,16 @@ class MortgageWindow(QMainWindow):
         # Issue 26 — foreign property panel (loan result used for combined view)
         if self._loan_result is not None:
             self.foreign_property_panel.set_loan_result(self._loan_result)
+
+        # Issue 19 — Italian property panel (loan result used for combined view)
+        if self._loan_result is not None:
+            self.italian_property_panel.set_loan_result(self._loan_result)
+
+    def _on_italian_property_toggled(self, checked: bool) -> None:
+        """Show or hide the Italian Property tab based on the checkbox."""
+        self.tabs.setTabVisible(self._italian_tab_index, checked)
+        if checked:
+            self.tabs.setCurrentIndex(self._italian_tab_index)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
