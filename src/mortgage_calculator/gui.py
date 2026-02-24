@@ -22,6 +22,8 @@ Signal flow:
 """
 
 import sys
+from datetime import date
+from pathlib import Path
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -32,6 +34,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -57,6 +60,7 @@ from mortgage_calculator.data.rates import (
     INSTITUTIONS,
     KURSKAERING_RATE,
     LOAN_TYPES,
+    RATES_DATE,
     RENTEFRADRAG_RATE_HIGH,
     RENTEFRADRAG_RATE_LOW,
     RENTEFRADRAG_THRESHOLD_DKK,
@@ -65,6 +69,65 @@ from mortgage_calculator.data.rates import (
 )
 from mortgage_calculator.tax import compute_rentefradrag
 from mortgage_calculator.models import LoanParams
+
+# ── Plain-text report generator ───────────────────────────────────────────────
+
+def _generate_report_text(
+    params: object,
+    ranked: list,
+    breakeven: dict,
+    loan_result: object,
+) -> str:
+    """
+    Build a plain-text report in the same format as the CLI export.
+    Returns the full report as a single string.
+    """
+    def fmt_dkk(v: float) -> str:
+        return f"DKK {v:,.0f}"
+
+    def fmt_pct(v: float) -> str:
+        return f"{v * 100:.3f}%"
+
+    lines = [
+        "Danish Mortgage Analysis Report",
+        f"Generated: {date.today().isoformat()}",
+        f"Rate data: {RATES_DATE}",
+        "=" * 60,
+        "",
+        "LOAN PARAMETERS",
+        f"  Property value:    {fmt_dkk(params.property_value_dkk)}",
+        f"  Loan amount:       {fmt_dkk(params.loan_amount_dkk)}",
+        f"  LTV:               {params.ltv:.1%}",
+        f"  Type:              {params.loan_type}",
+        f"  Term:              {params.term_years} years",
+        f"  IO period:         {params.io_years} years",
+        f"  Institution:       {params.institution}",
+        f"  Bond kurs:         {params.bond_kurs:.1f}",
+        "",
+        "INSTITUTION COMPARISON",
+    ]
+    for r in ranked:
+        bev = breakeven.get(r.institution, float("inf"))
+        bev_str = "—" if bev == 0.0 else ("∞" if bev == float("inf") else str(bev))
+        lines.append(
+            f"  #{r.rank} {r.institution:<20} "
+            f"Total: {fmt_dkk(r.total_lifetime_cost)}  "
+            f"ÅOP: {fmt_pct(r.aop)}  Breakeven: {bev_str} months"
+        )
+
+    lines += [
+        "",
+        "SELECTED INSTITUTION DETAIL",
+        f"  Total bond interest:   {fmt_dkk(loan_result.total_bond_interest)}",
+        f"  Total bidragssats:     {fmt_dkk(loan_result.total_bidragssats)}",
+        f"  Total principal:       {fmt_dkk(loan_result.total_principal)}",
+        f"  One-time costs:        {fmt_dkk(loan_result.one_time_costs)}",
+        f"  Total lifetime cost:   {fmt_dkk(loan_result.total_cost)}",
+        f"  ÅOP:                   {fmt_pct(loan_result.aop)}",
+    ]
+
+    return "\n".join(lines)
+
 
 # ── Tab index constants ───────────────────────────────────────────────────────
 TAB_COMPARISON = 0
@@ -577,10 +640,13 @@ class InputPanel(QWidget):
     Left-panel loan parameter form.
 
     Emits params_ready(LoanParams) whenever the inputs change and are valid.
-    MortgageWindow listens to this and runs the computation.
+    Emits params_invalid(str) with the validation error message when inputs
+    are incomplete or out of range.
+    MortgageWindow listens to both signals.
     """
 
-    params_ready = pyqtSignal(object)  # LoanParams
+    params_ready = pyqtSignal(object)   # LoanParams
+    params_invalid = pyqtSignal(str)    # validation error message
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -798,6 +864,7 @@ class InputPanel(QWidget):
             if "Value error," in msg:
                 msg = msg.split("Value error,")[-1].strip().rstrip("]").strip()
             self.error_label.setText(msg)
+            self.params_invalid.emit(msg)
             return
 
         self.params_ready.emit(params)
@@ -831,6 +898,13 @@ class MortgageWindow(QMainWindow):
         self._ranked = None
         self._breakeven = None
 
+        # ── Toolbar ───────────────────────────────────────────────────────────
+        toolbar = self.addToolBar("Main")
+        toolbar.setMovable(False)
+        self._export_action = toolbar.addAction("Export Report…")
+        self._export_action.setEnabled(False)
+        self._export_action.triggered.connect(self._on_export)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
 
@@ -855,7 +929,7 @@ class MortgageWindow(QMainWindow):
         self.tabs.addTab(self.payment_breakdown_chart, "Payment Breakdown")
         self.tabs.addTab(self.cost_comparison_widget, "Cost Comparison")
         self.tabs.addTab(self.tax_costs_panel, "Tax & Costs")
-        self.tabs.addTab(self._placeholder("Italian rental property P&L\n(Task 8)"), "Italian Property")
+        self.tabs.addTab(self._placeholder("Italian rental property P&L\n(issue #19 pending)"), "Italian Property")
         splitter.addWidget(self.tabs)
 
         splitter.setSizes([360, 840])
@@ -865,11 +939,14 @@ class MortgageWindow(QMainWindow):
             "Enter loan parameters on the left and press Calculate."
         )
 
-        # Wire input → computation
+        # Wire input → computation and error display
         self.input_panel.params_ready.connect(self._on_params_ready)
+        self.input_panel.params_invalid.connect(
+            lambda msg: self.statusBar().showMessage(f"Invalid input: {msg}")
+        )
 
     def _on_params_ready(self, params: LoanParams) -> None:
-        """Run full computation and update window; tabs will be filled by later tasks."""
+        """Run full computation and update all tabs."""
         self._loan_result = analyze_loan(params)
         self._ranked, self._breakeven = rank_with_breakeven(
             property_value_dkk=params.property_value_dkk,
@@ -882,8 +959,7 @@ class MortgageWindow(QMainWindow):
 
         p = self._loan_result.params
         self.setWindowTitle(
-            f"Mortgage — {p.loan_amount_dkk / 1e6:.2f}M DKK · "
-            f"{p.loan_type} · {p.term_years}y · {p.institution}"
+            f"DKK {p.loan_amount_dkk:,.0f} · {p.loan_type} · {p.term_years}y"
         )
         cheapest = self._ranked[0].institution
         self.statusBar().showMessage(
@@ -891,8 +967,33 @@ class MortgageWindow(QMainWindow):
             f"Total cost DKK {self._loan_result.total_cost:,.0f}  |  "
             f"Cheapest: {cheapest}"
         )
+        self._export_action.setEnabled(True)
 
         self._update_tabs()
+
+    def _on_export(self) -> None:
+        """Open save dialog and write the plain-text report."""
+        if self._loan_result is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Report",
+            "mortgage_report.txt",
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            text = _generate_report_text(
+                self._loan_result.params,
+                self._ranked,
+                self._breakeven,
+                self._loan_result,
+            )
+            Path(path).write_text(text, encoding="utf-8")
+            self.statusBar().showMessage(f"Report saved to {path}")
+        except OSError as exc:
+            self.statusBar().showMessage(f"Export failed: {exc}")
 
     def _update_tabs(self) -> None:
         """Called after every computation. Each task adds its update call here."""
