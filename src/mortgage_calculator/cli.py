@@ -26,6 +26,7 @@ from rich.text import Text
 from mortgage_calculator.calculator import analyze_loan
 from mortgage_calculator.comparison import rank_with_breakeven
 from mortgage_calculator.data.rates import (
+    BOND_KURS,
     EUR_DKK,
     INSTITUTIONS,
     LOAN_TYPES,
@@ -109,6 +110,17 @@ def prompt_loan_params() -> LoanParams:
     console.print(f"\n  Loan types: {', '.join(LOAN_TYPES)}")
     loan_type = Prompt.ask("  Loan type", choices=LOAN_TYPES, default="fixed_30y")
 
+    default_kurs = BOND_KURS.get(loan_type, 100.0)
+    console.print(
+        f"  [dim]Bond kurs: market price of the bond as %% of face value. "
+        f"At kurs {default_kurs}, a DKK 1,000,000 loan yields "
+        f"DKK {default_kurs * 10_000:,.0f} in proceeds — "
+        f"the DKK {(100 - default_kurs) * 10_000:,.0f} shortfall is an upfront cost.[/dim]"
+    )
+    bond_kurs = FloatPrompt.ask(
+        f"  Bond kurs (default from Feb 2026 rates)", default=default_kurs
+    )
+
     term_years = IntPrompt.ask("  Term (years)", default=30)
 
     io_years = IntPrompt.ask("  Interest-only years (0 = pure annuity)", default=0)
@@ -129,6 +141,7 @@ def prompt_loan_params() -> LoanParams:
                 term_years=term_years,
                 io_years=io_years,
                 institution=institution,
+                bond_kurs=bond_kurs,
             )
             return params
         except Exception as e:
@@ -320,15 +333,25 @@ def show_one_time_costs(loan_result) -> None:
     )
 
     loan = loan_result.params.loan_amount_dkk
+    kurs = loan_result.params.bond_kurs
     tinglysning = TINGLYSNING_FLAT_DKK + TINGLYSNING_RATE * loan
     kurskaering = KURSKAERING_RATE * loan
+    kurs_discount = max(0.0, (100.0 - kurs) / 100.0 * loan)
+
+    kurs_line = (
+        f"  Kurs discount (kurs {kurs:.1f}, {100 - kurs:.1f}%):  [red]{_fmt_dkk(kurs_discount)}[/red]\n"
+        f"    (You receive {_fmt_dkk(loan * kurs / 100)} but repay {_fmt_dkk(loan)} face value)\n\n"
+        if kurs_discount > 0
+        else f"  Kurs:                    {kurs:.1f} (at par — no discount)\n\n"
+    )
 
     text = (
         f"  Tinglysningsafgift:      {_fmt_dkk(tinglysning)}\n"
         f"    (DKK {TINGLYSNING_FLAT_DKK:,} flat + {TINGLYSNING_RATE*100:.2f}% of loan)\n\n"
         f"  Establishment fee:       {_fmt_dkk(ESTABLISHMENT_FEE_DKK)}\n\n"
         f"  Kursskæring (~{KURSKAERING_RATE*100:.2f}%):    {_fmt_dkk(kurskaering)}\n\n"
-        f"  ─────────────────────────────────────\n"
+        + kurs_line
+        + f"  ─────────────────────────────────────\n"
         f"  Total one-time costs:    [bold]{_fmt_dkk(loan_result.one_time_costs)}[/bold]\n"
     )
     console.print(Panel(text, title="One-Time Costs", border_style="red"))
@@ -363,6 +386,7 @@ def export_report(
         f"  Term:              {params.term_years} years",
         f"  IO period:         {params.io_years} years",
         f"  Institution:       {params.institution}",
+        f"  Bond kurs:         {params.bond_kurs:.1f}",
         "",
         "INSTITUTION COMPARISON",
     ]
@@ -419,6 +443,7 @@ def main() -> None:
             loan_type=params.loan_type,
             term_years=params.term_years,
             io_years=params.io_years,
+            bond_kurs=params.bond_kurs,
         )
         show_comparison_table(ranked, breakeven, params.institution)
 

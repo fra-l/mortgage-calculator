@@ -52,14 +52,19 @@ def get_effective_bidragssats(
     return rate
 
 
-def compute_one_time_costs(loan_amount_dkk: float) -> float:
+def compute_one_time_costs(loan_amount_dkk: float, bond_kurs: float = 100.0) -> float:
     """
     Return total one-time costs at origination (DKK).
-    Includes: tinglysning (flat + %), establishment fee, kursskæring.
+    Includes: tinglysning (flat + %), establishment fee, kursskæring, kurs discount.
+
+    Kurs discount: when kurs < 100, the borrower receives less cash than the face
+    value they will repay. The shortfall (100 - kurs)% of the loan is an upfront cost.
+    At kurs = 100 (par) the discount is zero.
     """
     tinglysning = TINGLYSNING_FLAT_DKK + TINGLYSNING_RATE * loan_amount_dkk
     kurskaering = KURSKAERING_RATE * loan_amount_dkk
-    return tinglysning + ESTABLISHMENT_FEE_DKK + kurskaering
+    kurs_discount = max(0.0, (100.0 - bond_kurs) / 100.0 * loan_amount_dkk)
+    return tinglysning + ESTABLISHMENT_FEE_DKK + kurskaering + kurs_discount
 
 
 def _monthly_annuity_payment(
@@ -194,7 +199,7 @@ def analyze_loan(params: LoanParams) -> LoanResult:
     Full loan analysis: schedule, totals, one-time costs, ÅOP.
     """
     schedule = build_amortization_schedule(params)
-    one_time_costs = compute_one_time_costs(params.loan_amount_dkk)
+    one_time_costs = compute_one_time_costs(params.loan_amount_dkk, params.bond_kurs)
 
     total_bond_interest = sum(row.bond_interest for row in schedule)
     total_bidragssats = sum(row.bidragssats for row in schedule)

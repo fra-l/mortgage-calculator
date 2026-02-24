@@ -2,16 +2,33 @@
 
 from pydantic import BaseModel, field_validator, model_validator
 
-from mortgage_calculator.data.rates import INSTITUTIONS, LOAN_TYPES
+from mortgage_calculator.data.rates import BOND_KURS, INSTITUTIONS, LOAN_TYPES
 
 
 class LoanParams(BaseModel):
     property_value_dkk: float          # Market value of the Danish property
-    loan_amount_dkk: float             # Principal being borrowed
+    loan_amount_dkk: float             # Principal being borrowed (face value of bond)
     loan_type: str                     # "fixed_30y" | "F1" | "F3" | "F5"
     term_years: int                    # Total loan term in years (e.g. 30)
     io_years: int = 0                  # Interest-only years at start (0 = pure annuity)
     institution: str                   # One of INSTITUTIONS
+    bond_kurs: float = 100.0           # Bond market price (% of face value); set from BOND_KURS by default
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_default_bond_kurs(cls, data: dict) -> dict:
+        """Default bond_kurs from BOND_KURS table if not explicitly provided."""
+        if isinstance(data, dict) and "bond_kurs" not in data:
+            loan_type = data.get("loan_type", "")
+            data["bond_kurs"] = BOND_KURS.get(loan_type, 100.0)
+        return data
+
+    @field_validator("bond_kurs")
+    @classmethod
+    def validate_bond_kurs(cls, v: float) -> float:
+        if not (50.0 <= v <= 110.0):
+            raise ValueError(f"bond_kurs {v} is outside the plausible range 50–110")
+        return v
 
     @field_validator("loan_type")
     @classmethod

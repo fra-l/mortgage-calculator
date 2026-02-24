@@ -66,6 +66,18 @@ BIDRAGSSATS: dict[str, BidragssatsTable] = {
 
 INSTITUTIONS: list[str] = list(BIDRAGSSATS.keys())
 
+# ── Bond kurs (market price) ──────────────────────────────────────────────────
+# Kurs is the market price of the bond as a percentage of face value.
+# kurs < 100: borrower receives less cash than the face value they repay.
+# kurs > 100: borrower receives more cash than the face value (premium bond).
+# These are approximate mid-market values for Feb 2026; verify before use.
+BOND_KURS: dict[str, float] = {
+    "fixed_30y": 98.0,    # 4% coupon at slight discount (rates close to coupon)
+    "F1":        99.5,    # Short reset -> resets to par quickly
+    "F3":        99.2,    # 3-year reset
+    "F5":        98.8,    # 5-year reset, slightly more discount
+}
+
 # ── One-time costs ────────────────────────────────────────────────────────────
 # Tinglysningsafgift: flat fee + percentage of loan amount
 TINGLYSNING_FLAT_DKK = 1_850        # DKK fixed portion

@@ -16,6 +16,7 @@ from mortgage_calculator.calculator import (
 )
 from mortgage_calculator.data.rates import (
     BIDRAGSSATS,
+    BOND_KURS,
     BOND_RATES,
     ESTABLISHMENT_FEE_DKK,
     KURSKAERING_RATE,
@@ -113,7 +114,7 @@ def test_amortization_sum_equals_principal():
 # ── Test 6: One-time costs formula ────────────────────────────────────────────
 
 def test_one_time_costs():
-    """Verify one-time cost computation against known formula."""
+    """Verify one-time cost computation at par (kurs=100, no discount)."""
     loan = 3_000_000.0
     expected = (
         TINGLYSNING_FLAT_DKK
@@ -121,8 +122,31 @@ def test_one_time_costs():
         + ESTABLISHMENT_FEE_DKK
         + KURSKAERING_RATE * loan
     )
-    result = compute_one_time_costs(loan)
+    result = compute_one_time_costs(loan, bond_kurs=100.0)
     assert abs(result - expected) < 0.01
+
+
+def test_one_time_costs_kurs_discount():
+    """Kurs below 100 adds (100 - kurs)% of loan as an upfront cost."""
+    loan = 3_000_000.0
+    kurs = 98.0
+    expected_base = (
+        TINGLYSNING_FLAT_DKK
+        + TINGLYSNING_RATE * loan
+        + ESTABLISHMENT_FEE_DKK
+        + KURSKAERING_RATE * loan
+    )
+    kurs_discount = (100.0 - kurs) / 100.0 * loan   # 2% of 3M = DKK 60,000
+    expected = expected_base + kurs_discount
+
+    result = compute_one_time_costs(loan, bond_kurs=kurs)
+    assert abs(result - expected) < 0.01
+
+    # At par no discount
+    assert compute_one_time_costs(loan, bond_kurs=100.0) == pytest.approx(expected_base, abs=0.01)
+
+    # Premium bond (kurs > 100): discount is zero (clamped)
+    assert compute_one_time_costs(loan, bond_kurs=101.0) == pytest.approx(expected_base, abs=0.01)
 
 
 # ── Test 7: ÅOP in plausible range ────────────────────────────────────────────

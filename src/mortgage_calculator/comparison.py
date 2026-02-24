@@ -27,14 +27,19 @@ def compare_institutions(
     loan_type: str,
     term_years: int,
     io_years: int = 0,
+    bond_kurs: float | None = None,
 ) -> list[RankedResult]:
     """
     Run analyze_loan for every institution with the given params.
     Returns results sorted ascending by total_lifetime_cost (cheapest first).
+
+    bond_kurs: market price of the bond (% of face value). If None, defaults
+               to BOND_KURS[loan_type] via LoanParams model_validator.
     """
     results: list[RankedResult] = []
 
     for institution in INSTITUTIONS:
+        extra = {"bond_kurs": bond_kurs} if bond_kurs is not None else {}
         params = LoanParams(
             property_value_dkk=property_value_dkk,
             loan_amount_dkk=loan_amount_dkk,
@@ -42,6 +47,7 @@ def compare_institutions(
             term_years=term_years,
             io_years=io_years,
             institution=institution,
+            **extra,
         )
         loan_result = analyze_loan(params)
 
@@ -97,6 +103,7 @@ def rank_with_breakeven(
     loan_type: str,
     term_years: int,
     io_years: int = 0,
+    bond_kurs: float | None = None,
 ) -> tuple[list[RankedResult], dict[str, float]]:
     """
     Run institution comparison and compute breakeven months for each institution
@@ -112,6 +119,7 @@ def rank_with_breakeven(
         loan_type=loan_type,
         term_years=term_years,
         io_years=io_years,
+        bond_kurs=bond_kurs,
     )
 
     cheapest = ranked[0]
