@@ -11,7 +11,7 @@ Layout:
             ├── Tab 2: Payment Breakdown
             ├── Tab 3: Cost Comparison
             ├── Tab 4: Tax & Costs
-            └── Tab 5: Italian Property
+            └── Tab 5: Foreign Property
 
 Signal flow:
   InputPanel.params_ready(LoanParams)
@@ -67,8 +67,12 @@ from mortgage_calculator.data.rates import (
     TINGLYSNING_FLAT_DKK,
     TINGLYSNING_RATE,
 )
-from mortgage_calculator.tax import compute_rentefradrag
-from mortgage_calculator.models import LoanParams
+from mortgage_calculator.tax import (
+    analyze_foreign_property,
+    combined_monthly_picture,
+    compute_rentefradrag,
+)
+from mortgage_calculator.models import ForeignPropertyParams, LoanParams
 
 # ── Plain-text report generator ───────────────────────────────────────────────
 
@@ -135,7 +139,7 @@ TAB_AMORTIZATION = 1
 TAB_PAYMENT_BREAKDOWN = 2
 TAB_COST_COMPARISON = 3
 TAB_TAX_COSTS = 4
-TAB_ITALIAN = 5
+TAB_FOREIGN_PROPERTY = 5
 
 # ── Comparison table helpers ──────────────────────────────────────────────────
 
@@ -633,6 +637,257 @@ class TaxCostsPanelWidget(QWidget):
         return line
 
 
+# ── Foreign property panel (Tab 5) ────────────────────────────────────────────
+
+class ForeignPropertyPanelWidget(QWidget):
+    """
+    Tab 5 — Foreign Property Analysis.
+
+    Self-contained panel: enter foreign property parameters (rental income,
+    expenses, existing foreign mortgage, tax rates, exchange rate, and Danish
+    annual income for the debt ceiling check), click Compute, then see:
+      • Rental P&L with cross-border tax breakdown.
+      • Danish debt ceiling analysis showing how the foreign mortgage reduces
+        the remaining headroom.
+      • Combined monthly picture (DK mortgage cost minus foreign net income)
+        when a Danish loan result is available.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._loan_result = None
+        self._setup_ui()
+
+    def set_loan_result(self, loan_result: object) -> None:
+        """Called by MortgageWindow after each Danish loan computation."""
+        self._loan_result = loan_result
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _setup_ui(self) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self._container = QWidget()
+        self._vlayout = QVBoxLayout(self._container)
+        self._vlayout.setSpacing(16)
+        self._vlayout.setContentsMargins(12, 12, 12, 12)
+
+        self._vlayout.addWidget(self._build_input_group())
+        self._vlayout.addStretch()
+
+        scroll.setWidget(self._container)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+    def _build_input_group(self) -> QGroupBox:
+        box = QGroupBox("Foreign Property Parameters")
+        form = QFormLayout(box)
+        form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+        def _spinbox(
+            lo: float, hi: float, step: float, val: float,
+            decimals: int = 0, suffix: str = "",
+        ) -> QDoubleSpinBox:
+            sb = QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setSingleStep(step)
+            sb.setValue(val)
+            sb.setDecimals(decimals)
+            if decimals == 0:
+                sb.setGroupSeparatorShown(True)
+            if suffix:
+                sb.setSuffix(suffix)
+            return sb
+
+        self._prop_value = _spinbox(0, 100_000_000, 10_000, 250_000)
+        form.addRow("Property value (foreign currency):", self._prop_value)
+
+        self._monthly_rent = _spinbox(0, 1_000_000, 100, 1_200, decimals=2)
+        form.addRow("Monthly rental income (foreign):", self._monthly_rent)
+
+        self._monthly_expenses = _spinbox(0, 100_000, 50, 200, decimals=2)
+        form.addRow("Monthly operating expenses (foreign):", self._monthly_expenses)
+
+        self._mortgage_balance = _spinbox(0, 10_000_000, 10_000, 0)
+        form.addRow("Foreign mortgage balance:", self._mortgage_balance)
+
+        self._mortgage_rate = _spinbox(0, 20, 0.1, 3.5, decimals=2, suffix=" %")
+        form.addRow("Foreign mortgage annual rate:", self._mortgage_rate)
+
+        self._foreign_tax_rate = _spinbox(0, 60, 0.5, 21.0, decimals=1, suffix=" %")
+        form.addRow("Foreign income tax rate:", self._foreign_tax_rate)
+
+        self._dk_tax_rate = _spinbox(0, 60, 0.5, 42.0, decimals=1, suffix=" %")
+        form.addRow("DK marginal tax rate:", self._dk_tax_rate)
+
+        self._currency_to_dkk = _spinbox(0.01, 10_000, 0.01, 7.46, decimals=4)
+        form.addRow("Exchange rate (1 foreign = X DKK):", self._currency_to_dkk)
+
+        self._annual_income = _spinbox(
+            0, 100_000_000, 50_000, 600_000, suffix=" DKK"
+        )
+        form.addRow("Annual gross income (DKK, for debt ceiling):", self._annual_income)
+
+        self._debt_multiplier = _spinbox(1, 10, 0.5, 3.5, decimals=1)
+        form.addRow("Debt ceiling multiplier (× income):", self._debt_multiplier)
+
+        compute_btn = QPushButton("Compute")
+        compute_btn.setStyleSheet(
+            "QPushButton { font-weight: bold; padding: 6px; }"
+            "QPushButton:hover { background: #0078d7; color: white; }"
+        )
+        compute_btn.clicked.connect(self._compute)
+        form.addRow(compute_btn)
+
+        return box
+
+    # ── Compute & results ─────────────────────────────────────────────────────
+
+    def _compute(self) -> None:
+        params = ForeignPropertyParams(
+            property_value_foreign=self._prop_value.value(),
+            monthly_rental_income_foreign=self._monthly_rent.value(),
+            monthly_expenses_foreign=self._monthly_expenses.value(),
+            foreign_mortgage_balance=self._mortgage_balance.value(),
+            foreign_mortgage_rate=self._mortgage_rate.value() / 100,
+            foreign_income_tax_rate=self._foreign_tax_rate.value() / 100,
+            dk_marginal_tax_rate=self._dk_tax_rate.value() / 100,
+            currency_to_dkk=self._currency_to_dkk.value(),
+            annual_gross_income_dkk=self._annual_income.value(),
+            debt_ceiling_multiplier=self._debt_multiplier.value(),
+        )
+        result = analyze_foreign_property(params)
+        self._show_results(result)
+
+    def _show_results(self, result: object) -> None:
+        # Remove all widgets after the input group (index 0)
+        while self._vlayout.count() > 1:
+            item = self._vlayout.takeAt(1)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self._vlayout.addWidget(self._build_pl_group(result))
+        self._vlayout.addWidget(self._build_debt_ceiling_group(result))
+        self._vlayout.addWidget(self._build_tax_note_group(result))
+
+        if self._loan_result is not None:
+            self._vlayout.addWidget(self._build_combined_group(result))
+
+        self._vlayout.addStretch()
+
+    def _build_pl_group(self, result: object) -> QGroupBox:
+        box = QGroupBox("Rental P&L (Monthly)")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+
+        def _frow(label: str, value: float, bold: bool = False) -> None:
+            lbl = _bold(label) if bold else QLabel(label)
+            val = _bold(f"{value:,.2f}") if bold else QLabel(f"{value:,.2f}")
+            form.addRow(lbl, val)
+
+        def _drow(label: str, value: float, bold: bool = False) -> None:
+            lbl = _bold(label) if bold else QLabel(label)
+            val = _bold(_dkk(value)) if bold else QLabel(_dkk(value))
+            form.addRow(lbl, val)
+
+        _frow("Gross rental income (foreign):", result.gross_monthly_foreign)
+        _frow("− Operating expenses:", result.expenses_monthly_foreign)
+        _frow("− Foreign mortgage interest:", result.foreign_mortgage_interest_foreign)
+        form.addRow(self._sep())
+        _frow("Taxable base:", result.taxable_base_foreign)
+        _frow("− Foreign tax:", result.foreign_tax_monthly_foreign)
+        form.addRow(self._sep())
+        _frow(
+            "Net after foreign tax (foreign):", result.net_monthly_foreign, bold=True
+        )
+        form.addRow(self._sep())
+        _drow("− DK top-up tax:", result.dk_topup_tax_monthly_dkk)
+        form.addRow(self._sep())
+        _drow("Net monthly income (DKK):", result.net_monthly_dkk, bold=True)
+
+        return box
+
+    def _build_debt_ceiling_group(self, result: object) -> QGroupBox:
+        box = QGroupBox("Danish Debt Ceiling Analysis")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+
+        if result.max_total_debt_dkk > 0:
+            form.addRow(
+                QLabel("Max total debt:"), QLabel(_dkk(result.max_total_debt_dkk))
+            )
+            form.addRow(
+                QLabel("− Foreign mortgage (DKK):"),
+                QLabel(_dkk(result.foreign_mortgage_dkk)),
+            )
+            form.addRow(self._sep())
+            form.addRow(
+                _bold("Available DK debt headroom:"),
+                _bold(_dkk(result.available_dk_debt_dkk)),
+            )
+        else:
+            note = QLabel(
+                "Annual gross income not entered — debt ceiling not computed.\n"
+                "Enter your Danish annual gross income above and re-compute."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #888; font-size: 11px;")
+            form.addRow(note)
+
+        return box
+
+    def _build_tax_note_group(self, result: object) -> QGroupBox:
+        box = QGroupBox("Cross-Border Taxation Note")
+        layout = QVBoxLayout(box)
+        note = QLabel(result.cross_border_tax_note)
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555; font-size: 11px;")
+        layout.addWidget(note)
+        return box
+
+    def _build_combined_group(self, result: object) -> QGroupBox:
+        box = QGroupBox("Combined Monthly Picture (Month 1)")
+        form = QFormLayout(box)
+        form.setSpacing(6)
+
+        combined = combined_monthly_picture(self._loan_result, result, month=1)
+
+        form.addRow(
+            QLabel("DK mortgage gross cost:"),
+            QLabel(_dkk(combined["dk_gross_cost_dkk"])),
+        )
+        form.addRow(
+            QLabel("− Rentefradrag saving:"),
+            QLabel(_dkk(combined["rentefradrag_saving_dkk"])),
+        )
+        form.addRow(self._sep())
+        form.addRow(
+            QLabel("DK mortgage net cost:"),
+            QLabel(_dkk(combined["dk_net_cost_dkk"])),
+        )
+        form.addRow(
+            QLabel("− Foreign property net income:"),
+            QLabel(_dkk(combined["foreign_income_dkk"])),
+        )
+        form.addRow(self._sep())
+        form.addRow(
+            _bold("Net monthly outflow (DKK):"),
+            _bold(_dkk(combined["combined_net_dkk"])),
+        )
+
+        return box
+
+    def _sep(self) -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        return line
+
+
 # ── Input panel ───────────────────────────────────────────────────────────────
 
 class InputPanel(QWidget):
@@ -924,12 +1179,13 @@ class MortgageWindow(QMainWindow):
         self.payment_breakdown_chart = PaymentBreakdownChartWidget()
         self.cost_comparison_widget = CostComparisonWidget()
         self.tax_costs_panel = TaxCostsPanelWidget()
+        self.foreign_property_panel = ForeignPropertyPanelWidget()
         self.tabs.addTab(self.comparison_table, "Comparison")
         self.tabs.addTab(self.amortization_chart, "Amortization")
         self.tabs.addTab(self.payment_breakdown_chart, "Payment Breakdown")
         self.tabs.addTab(self.cost_comparison_widget, "Cost Comparison")
         self.tabs.addTab(self.tax_costs_panel, "Tax & Costs")
-        self.tabs.addTab(self._placeholder("Italian rental property P&L\n(issue #19 pending)"), "Italian Property")
+        self.tabs.addTab(self.foreign_property_panel, "Foreign Property")
         splitter.addWidget(self.tabs)
 
         splitter.setSizes([360, 840])
@@ -1020,15 +1276,9 @@ class MortgageWindow(QMainWindow):
         if self._loan_result is not None:
             self.tax_costs_panel.refresh(self._loan_result)
 
-    def _placeholder(self, text: str) -> QWidget:
-        """Centred placeholder for tabs not yet implemented."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        label = QLabel(text)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #888; font-size: 14px;")
-        layout.addWidget(label)
-        return widget
+        # Issue 26 — foreign property panel (loan result used for combined view)
+        if self._loan_result is not None:
+            self.foreign_property_panel.set_loan_result(self._loan_result)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

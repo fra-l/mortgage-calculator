@@ -1,46 +1,44 @@
 """
-Danish and Italian tax logic for the mortgage calculator.
+Danish mortgage tax logic and foreign property cross-border analysis.
 
 Danish rentefradrag:
   - Applies ONLY to bond interest (not bidragssats).
   - 33% on first DKK 50,000 of annual net interest.
   - 25% on annual net interest above DKK 50,000.
 
-Italian cross-border view (DK-IT tax treaty, 1999):
-  - Article 6: rental income from Italian property is taxed only in Italy.
-  - Denmark uses exemption-with-progression method.
-  - Italian mortgage interest deductibility in Denmark: UNCERTAIN — tool shows
-    a disclaimer and does NOT auto-deduct.
+Cross-border rental income (credit method):
+  - Foreign rental income is taxed in the source country at the foreign rate.
+  - Denmark, as country of tax residence, taxes the difference between the
+    Danish marginal rate and the foreign rate (top-up tax).
+  - Net effect: the taxpayer pays the higher of the two rates, split between
+    countries, with no double taxation of the same base.
+  - The foreign mortgage balance reduces the available Danish debt ceiling
+    (max debt = annual income × debt_ceiling_multiplier).
 """
 
 from mortgage_calculator.data.rates import (
-    EUR_DKK,
     RENTEFRADRAG_RATE_HIGH,
     RENTEFRADRAG_RATE_LOW,
     RENTEFRADRAG_THRESHOLD_DKK,
 )
 from mortgage_calculator.models import (
-    ItalianPropertyParams,
-    ItalianPropertyResult,
+    ForeignPropertyParams,
+    ForeignPropertyResult,
     LoanResult,
 )
 
-# ── Static disclaimer strings ─────────────────────────────────────────────────
+# ── Static informational note ─────────────────────────────────────────────────
 
-TREATY_NOTE = (
-    "DK-IT Tax Treaty (1999), Article 6: Rental income from Italian real property "
-    "is taxable ONLY in Italy. Denmark applies the exemption-with-progression method "
-    "(Article 23(1)(a)): Italian income is exempt from Danish tax but may increase "
-    "the marginal Danish tax rate applied to your other income."
-)
-
-IT_DEDUCTIBILITY_DISCLAIMER = (
-    "DISCLAIMER — Italian mortgage interest in Denmark: It is UNCERTAIN whether "
-    "interest paid on an Italian mortgage is deductible under Danish rentefradrag rules. "
-    "The deduction depends on whether the Italian mortgage is secured on Danish income "
-    "or constitutes a qualifying 'gældsrente' under ligningslovens § 6. "
-    "Consult a Danish tax adviser (e.g. Skatteforvaltningen or a licensed tax consultant) "
-    "before claiming this deduction. This tool does NOT apply it automatically."
+CROSS_BORDER_TAX_NOTE = (
+    "Cross-border taxation (credit method): As a Danish tax resident with foreign "
+    "rental income, you pay income tax in the source country at the local rate. "
+    "Denmark then taxes the difference between the Danish marginal rate and the "
+    "foreign rate on the same taxable base, so you effectively pay the higher of "
+    "the two rates — but split between countries with no double taxation. "
+    "The foreign mortgage balance is treated as existing debt and reduces the "
+    "remaining headroom under the Danish debt ceiling (max debt = annual income × "
+    "multiplier). Consult a Danish tax adviser (Skatteforvaltningen or a licensed "
+    "tax consultant) to confirm the treatment in your specific situation."
 )
 
 
@@ -82,48 +80,79 @@ def compute_monthly_rentefradrag(loan_result: LoanResult) -> list[float]:
     return savings
 
 
-# ── Italian property analysis ─────────────────────────────────────────────────
+# ── Foreign property analysis ─────────────────────────────────────────────────
 
-def analyze_italian_property(it: ItalianPropertyParams) -> ItalianPropertyResult:
+def analyze_foreign_property(fp: ForeignPropertyParams) -> ForeignPropertyResult:
     """
-    Monthly P&L for the Italian rental property (EUR and DKK).
+    Monthly P&L for a foreign rental property.
 
-    Italian tax is applied to (rental income - operating expenses - mortgage interest).
-    If Italian mortgage exists, its monthly interest is deducted before Italian tax.
+    Tax logic (credit method):
+      1. Taxable base = rental income − operating expenses − foreign mortgage interest.
+      2. Foreign tax = taxable_base × foreign_income_tax_rate.
+      3. DK top-up tax = taxable_base × max(0, dk_marginal_tax_rate − foreign_rate),
+         converted to DKK.  Together these equal paying the higher rate in full.
+
+    Debt ceiling logic:
+      Max total debt = annual_gross_income_dkk × debt_ceiling_multiplier.
+      The foreign mortgage balance (in DKK) reduces the remaining headroom.
     """
-    monthly_it_mortgage_interest = (
-        it.italian_mortgage_balance_eur * it.italian_mortgage_rate / 12
-        if it.italian_mortgage_balance_eur > 0
+    monthly_foreign_mortgage_interest = (
+        fp.foreign_mortgage_balance * fp.foreign_mortgage_rate / 12
+        if fp.foreign_mortgage_balance > 0
         else 0.0
     )
 
-    # Italian taxable base: gross income minus deductible expenses and mortgage interest
-    italian_taxable = max(
+    # Taxable base: gross income minus deductible items (floored at zero)
+    taxable_base = max(
         0.0,
-        it.monthly_rental_income_eur
-        - it.monthly_expenses_eur
-        - monthly_it_mortgage_interest,
+        fp.monthly_rental_income_foreign
+        - fp.monthly_expenses_foreign
+        - monthly_foreign_mortgage_interest,
     )
-    italian_tax = round(italian_taxable * it.italian_tax_rate, 2)
 
-    net_monthly_eur = round(
-        it.monthly_rental_income_eur
-        - it.monthly_expenses_eur
-        - monthly_it_mortgage_interest
-        - italian_tax,
+    # Foreign tax paid in source country
+    foreign_tax = round(taxable_base * fp.foreign_income_tax_rate, 2)
+
+    # DK top-up: Danish taxes the excess of its rate over the foreign rate
+    dk_topup_rate = max(0.0, fp.dk_marginal_tax_rate - fp.foreign_income_tax_rate)
+    dk_topup_tax_dkk = round(taxable_base * fp.currency_to_dkk * dk_topup_rate, 2)
+
+    # Net monthly in foreign currency (after foreign tax and mortgage interest)
+    net_monthly_foreign = round(
+        fp.monthly_rental_income_foreign
+        - fp.monthly_expenses_foreign
+        - monthly_foreign_mortgage_interest
+        - foreign_tax,
         2,
     )
-    net_monthly_dkk = round(net_monthly_eur * EUR_DKK, 2)
 
-    return ItalianPropertyResult(
-        gross_monthly_eur=it.monthly_rental_income_eur,
-        expenses_monthly_eur=it.monthly_expenses_eur,
-        italian_tax_monthly_eur=italian_tax,
-        italian_mortgage_interest_eur=round(monthly_it_mortgage_interest, 2),
-        net_monthly_eur=net_monthly_eur,
+    # Net in DKK after converting and deducting DK top-up tax
+    net_monthly_dkk = round(
+        net_monthly_foreign * fp.currency_to_dkk - dk_topup_tax_dkk, 2
+    )
+
+    # Debt ceiling analysis
+    max_total_debt_dkk = round(
+        fp.annual_gross_income_dkk * fp.debt_ceiling_multiplier, 2
+    )
+    foreign_mortgage_dkk = round(fp.foreign_mortgage_balance * fp.currency_to_dkk, 2)
+    available_dk_debt_dkk = round(
+        max(0.0, max_total_debt_dkk - foreign_mortgage_dkk), 2
+    )
+
+    return ForeignPropertyResult(
+        gross_monthly_foreign=fp.monthly_rental_income_foreign,
+        expenses_monthly_foreign=fp.monthly_expenses_foreign,
+        foreign_mortgage_interest_foreign=round(monthly_foreign_mortgage_interest, 2),
+        taxable_base_foreign=round(taxable_base, 2),
+        foreign_tax_monthly_foreign=foreign_tax,
+        dk_topup_tax_monthly_dkk=dk_topup_tax_dkk,
+        net_monthly_foreign=net_monthly_foreign,
         net_monthly_dkk=net_monthly_dkk,
-        treaty_note=TREATY_NOTE,
-        it_deductibility_disclaimer=IT_DEDUCTIBILITY_DISCLAIMER,
+        max_total_debt_dkk=max_total_debt_dkk,
+        foreign_mortgage_dkk=foreign_mortgage_dkk,
+        available_dk_debt_dkk=available_dk_debt_dkk,
+        cross_border_tax_note=CROSS_BORDER_TAX_NOTE,
     )
 
 
@@ -131,24 +160,24 @@ def analyze_italian_property(it: ItalianPropertyParams) -> ItalianPropertyResult
 
 def combined_monthly_picture(
     loan_result: LoanResult,
-    it_result: ItalianPropertyResult,
+    foreign_result: ForeignPropertyResult,
     month: int = 1,
 ) -> dict[str, float]:
     """
     Net combined monthly cash flow (DKK) for a given month.
 
-    Danish mortgage cost minus Italian rental net income (converted to DKK).
-    A positive combined_cost means net outflow; negative means the Italian
-    property offsets more than the mortgage costs.
+    Danish mortgage net cost minus foreign rental net income (converted to DKK,
+    after all taxes).  A positive combined_net means net outflow; negative means
+    the foreign property offsets more than the mortgage costs.
 
     Args:
-        loan_result: Full Danish loan analysis.
-        it_result:   Italian property P&L (static — does not change month-to-month
-                     unless rents/expenses change).
-        month:       1-based month index into the schedule.
+        loan_result:     Full Danish loan analysis.
+        foreign_result:  Foreign property P&L (static per analysis run).
+        month:           1-based month index into the schedule.
 
     Returns:
-        Dict with dk_cost_dkk, it_income_dkk, combined_net_dkk.
+        Dict with dk_gross_cost_dkk, rentefradrag_saving_dkk, dk_net_cost_dkk,
+        foreign_income_dkk, combined_net_dkk.
     """
     idx = max(0, min(month - 1, len(loan_result.schedule) - 1))
     row = loan_result.schedule[idx]
@@ -159,12 +188,12 @@ def combined_monthly_picture(
     dk_gross_cost = row.total_payment
     dk_net_cost = round(dk_gross_cost - monthly_rentefradrag, 2)
 
-    combined_net = round(dk_net_cost - it_result.net_monthly_dkk, 2)
+    combined_net = round(dk_net_cost - foreign_result.net_monthly_dkk, 2)
 
     return {
         "dk_gross_cost_dkk": dk_gross_cost,
         "rentefradrag_saving_dkk": round(monthly_rentefradrag, 2),
         "dk_net_cost_dkk": dk_net_cost,
-        "it_income_dkk": it_result.net_monthly_dkk,
+        "foreign_income_dkk": foreign_result.net_monthly_dkk,
         "combined_net_dkk": combined_net,
     }

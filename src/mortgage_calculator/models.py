@@ -93,21 +93,29 @@ class LoanResult(BaseModel):
     aop: float                       # Årlige Omkostninger i Procent (effective annual rate)
 
 
-class ItalianPropertyParams(BaseModel):
-    property_value_eur: float           # Market value in EUR
-    monthly_rental_income_eur: float    # Gross rental income per month
-    monthly_expenses_eur: float         # Operating expenses (maintenance, insurance, etc.)
-    italian_mortgage_balance_eur: float = 0.0   # Outstanding IT mortgage (if any)
-    italian_mortgage_rate: float = 0.0           # Annual rate on IT mortgage
-    italian_tax_rate: float = 0.21               # Italian effective tax on rental income
+class ForeignPropertyParams(BaseModel):
+    property_value_foreign: float          # Market value in foreign currency
+    monthly_rental_income_foreign: float   # Gross rental income per month
+    monthly_expenses_foreign: float        # Operating expenses (maintenance, insurance, etc.)
+    foreign_mortgage_balance: float = 0.0  # Outstanding foreign mortgage balance
+    foreign_mortgage_rate: float = 0.0     # Annual rate on foreign mortgage
+    foreign_income_tax_rate: float = 0.21  # Effective income tax rate in foreign country
+    dk_marginal_tax_rate: float = 0.42     # Danish marginal tax rate (for top-up calculation)
+    currency_to_dkk: float = 7.46          # Exchange rate: 1 foreign currency unit = X DKK
+    annual_gross_income_dkk: float = 0.0   # Annual gross income in Denmark (for debt ceiling)
+    debt_ceiling_multiplier: float = 3.5   # Max total debt = multiplier × annual income
 
 
-class ItalianPropertyResult(BaseModel):
-    gross_monthly_eur: float            # Rental income
-    expenses_monthly_eur: float         # Operating expenses
-    italian_tax_monthly_eur: float      # Italian tax on net rental
-    italian_mortgage_interest_eur: float  # Monthly IT mortgage interest
-    net_monthly_eur: float              # After Italian tax and mortgage
-    net_monthly_dkk: float              # Converted at EUR_DKK peg
-    treaty_note: str                    # DK-IT treaty information
-    it_deductibility_disclaimer: str    # Uncertainty disclaimer for DK deduction
+class ForeignPropertyResult(BaseModel):
+    gross_monthly_foreign: float            # Rental income in foreign currency
+    expenses_monthly_foreign: float         # Operating expenses
+    foreign_mortgage_interest_foreign: float  # Monthly mortgage interest on foreign property
+    taxable_base_foreign: float             # gross − expenses − mortgage interest (≥ 0)
+    foreign_tax_monthly_foreign: float      # Foreign country tax paid on rental income
+    dk_topup_tax_monthly_dkk: float         # Danish top-up tax (DK rate − foreign rate)
+    net_monthly_foreign: float              # After foreign tax and mortgage cost (foreign currency)
+    net_monthly_dkk: float                  # Net income in DKK after all taxes
+    max_total_debt_dkk: float               # annual_income × debt_ceiling_multiplier
+    foreign_mortgage_dkk: float             # Foreign mortgage balance converted to DKK
+    available_dk_debt_dkk: float            # Remaining Danish debt headroom
+    cross_border_tax_note: str              # Informational note on cross-border taxation
